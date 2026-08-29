@@ -7,10 +7,18 @@ param(
 $ErrorActionPreference = 'Stop'
 $containerName = "netty-limiter-redis-$PID"
 $root = Split-Path -Parent $PSScriptRoot
+$containerCreated = $false
 
 try {
     docker version | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Docker engine is unavailable; start Docker Desktop Linux engine first"
+    }
     docker run --name $containerName -d -p "${RedisPort}:6379" redis:7.2-alpine | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to start Redis container on port $RedisPort"
+    }
+    $containerCreated = $true
     $ready = $false
     for ($i = 0; $i -lt 30; $i++) {
         try {
@@ -40,5 +48,7 @@ try {
     }
     Write-Host "Results: $root\target\perf-results\redis-limiter-comparison.csv"
 } finally {
-    docker rm -f $containerName 2>$null | Out-Null
+    if ($containerCreated) {
+        docker rm -f $containerName 2>$null | Out-Null
+    }
 }
