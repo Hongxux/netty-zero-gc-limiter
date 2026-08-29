@@ -20,6 +20,12 @@
 .\scripts\run-real-redis-validation.ps1 -Threads 16 -OpsPerThread 2000 -RedisPort 6379
 ```
 
+如果 Docker 中已经有 Redis（例如已映射到 6379），复用它而不创建新容器：
+
+```powershell
+.\scripts\run-real-redis-validation.ps1 -UseExistingRedis -RedisPort 6379
+```
+
 ## 固定测试数据
 
 - UID：线程 `t` 的第 `i` 个请求使用 `t * OpsPerThread + i`。

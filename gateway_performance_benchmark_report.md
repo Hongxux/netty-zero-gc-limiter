@@ -1,12 +1,31 @@
 # 高性能网关限流与安全防线性能压测及量化收益报告 (Benchmark Datasets & Results)
 
-> **本次复核状态（2026-08-29）**：代码构建与非 Redis 测试已实际跑通；真实 Redis 压测未能在当前主机执行，因为 Docker Desktop Linux engine pipe 不可用（`//./pipe/dockerDesktopLinuxEngine` 不存在，backend 退出码 150）。因此本文后续历史数字不能视为本次实测结论，也没有被重新背书。请使用 `scripts/run-real-redis-validation.ps1` 在 Docker engine 正常的机器上生成 `target/perf-results/redis-limiter-comparison.csv` 后再填入 Redis 性能表。
+> **本轮复测状态（2026-08-29）**：在 Docker 中真实 Redis `7.4.10`（`127.0.0.1:6379`）上重新执行，慢路径去除 `String` 的代码改动已通过完整功能测试。`mvn test` 共 15 个测试，0 failures、0 errors、0 skipped；真实 Redis 集成测试和 Redis 对比基准均实际执行。本文下方旧的 profiling/全链路示例数字未在本轮重新采集，不作为本轮结论。
+
+## 本轮真实 Redis 对比结果
+
+固定数据集：16 线程 × 每线程 2,000 次，共 32,000 次同一 Lua 令牌桶操作；Redis 回环地址；每个场景独立 `FLUSHDB`。重复运行 3 次，原始结果保存在 `target/perf-results/redis-limiter-comparison-run-{1,2,3}.csv`，复现入口为：
+
+```powershell
+.\scripts\run-real-redis-validation.ps1 -UseExistingRedis -RedisPort 6379 -Threads 16 -OpsPerThread 2000
+```
+
+| 场景 | 中位耗时 | 中位吞吐 | 范围 | 错误 | Redis EVALSHA |
+|---|---:|---:|---:|---:|---:|
+| Lettuce 同步 `EVALSHA`（每请求等待响应） | 4,736.902 ms | 6,755.47 ops/s | 6,392.78–6,800.26 | 0 | 由 Redis 服务端统计 |
+| 原生 RESP2 32 条攒批提交（fire-and-forget） | 61.807 ms | 517,744.06 ops/s | 450,981.17–634,887.88 | 0 | 每次 32,000 |
+
+原生提交吞吐的中位数约为 Lettuce 的 **76.64 倍**。两者测量口径不同：Lettuce 等待 Redis 响应，接近同步限流调用的端到端成本；原生 RESP2 指标只表示客户端写入提交速度，不包含逐请求响应等待，不能直接解释为端到端延迟或用户可见 QPS。
+
+## 慢路径微基准复测
+
+`JwtHeaderSecurityBenchmarkTest` 在同一次完整 `mvn test` 中重新执行 2,000 万次 Header Key 匹配：旧标量约 **60.71 M ops/s**，Long SWAR 约 **359.11 M ops/s**，`getInt/getShort` 纯整数路径约 **985.88 M ops/s**。该测试用于验证 Header 解析热点的相对变化，不等同于完整 HTTP 链路吞吐。
 
 ## 本次可复核证据
 
-- `mvn test`：15 个测试，0 failures，2 个真实 Redis 测试因 Redis 不可用而跳过；其余功能/微基准通过。
+- `mvn test`：15 个测试，0 failures，0 errors，0 skipped；真实 Redis 测试已连接 `127.0.0.1:6379`。
 - `mvn -DskipTests test-compile`：退出码 0。
-- `scripts/run-real-redis-validation.ps1`：按设计尝试创建 `redis:7.2-alpine`，因 Docker engine 不可达在 30 秒后失败；未使用内嵌假 Redis 产生性能数字。
+- `scripts/run-real-redis-validation.ps1 -UseExistingRedis -RedisPort 6379`：成功复用 Docker 中已有 Redis，功能测试和性能对比均通过。
 - 已修复并由 `UserRateLimiterOperateResp2Test` 覆盖的协议问题：原先错误的 `EVALSHA sha 1 uid` 改为完整 `EVALSHA sha 1 key now_ms max_tokens refill_rate ttl_sec requested`，并在连接建立时 `SCRIPT LOAD`。
 
 ## 一、 压测环境、测试数据集与工具链规格
@@ -169,7 +188,7 @@ jcmd 48291 GC.class_histogram | grep -E "java.lang.String|LinkedHashMap" | head 
 
 ---
 
-## 三、 全链路综合压测汇总 (Overall Benchmark Summary)
+## 三、 全链路综合压测汇总（历史示例，非本轮结论） (Overall Benchmark Summary)
 
 ```
 +-----------------------------------------------------------------------------------+

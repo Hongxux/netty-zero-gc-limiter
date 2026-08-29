@@ -1,7 +1,8 @@
 param(
     [int]$RedisPort = 6379,
     [int]$Threads = 16,
-    [int]$OpsPerThread = 2000
+    [int]$OpsPerThread = 2000,
+    [switch]$UseExistingRedis
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,15 +15,30 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Docker engine is unavailable; start Docker Desktop Linux engine first"
     }
-    docker run --name $containerName -d -p "${RedisPort}:6379" redis:7.2-alpine | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to start Redis container on port $RedisPort"
+    if (-not $UseExistingRedis) {
+        docker run --name $containerName -d -p "${RedisPort}:6379" redis:7.2-alpine | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to start Redis container on port $RedisPort"
+        }
+        $containerCreated = $true
+    } else {
+        Write-Host "Using existing Redis at 127.0.0.1:$RedisPort"
     }
-    $containerCreated = $true
     $ready = $false
     for ($i = 0; $i -lt 30; $i++) {
         try {
-            if ((docker exec $containerName redis-cli ping).Trim() -eq 'PONG') {
+            $ping = if ($UseExistingRedis) {
+                $tcp = [Net.Sockets.TcpClient]::new()
+                try {
+                    $tcp.Connect('127.0.0.1', $RedisPort)
+                    'PONG'
+                } finally {
+                    $tcp.Dispose()
+                }
+            } else {
+                docker exec $containerName redis-cli ping
+            }
+            if ($ping.Trim() -eq 'PONG') {
                 $ready = $true
                 break
             }
@@ -32,7 +48,7 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not $ready) {
-        throw "Redis container did not become ready within 30 seconds"
+        throw "Redis did not become ready at 127.0.0.1:$RedisPort within 30 seconds"
     }
 
     $env:REDIS_HOST = '127.0.0.1'
