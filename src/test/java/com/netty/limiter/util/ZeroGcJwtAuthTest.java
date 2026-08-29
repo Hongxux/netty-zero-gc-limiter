@@ -13,7 +13,7 @@ import java.util.Base64;
 
 public class ZeroGcJwtAuthTest {
 
-    private static final String SECRET = "damai-seckill-secret";
+    private static final String SECRET = "secret";
 
     private String generateValidJwt(String headerJson, String payloadJson) throws Exception {
         String headerB64 = Base64.getUrlEncoder().withoutPadding().encodeToString(headerJson.getBytes(StandardCharsets.UTF_8));

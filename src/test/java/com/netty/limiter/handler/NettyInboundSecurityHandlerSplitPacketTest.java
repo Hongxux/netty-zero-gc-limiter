@@ -24,7 +24,7 @@ import static org.mockito.Mockito.when;
 
 public class NettyInboundSecurityHandlerSplitPacketTest {
 
-    private static final String SECRET = "damai-seckill-secret";
+    private static final String SECRET = "secret";
 
     @Mock
     private LocalGlobalRateLimiter localGlobalRateLimiter;
@@ -56,8 +56,7 @@ public class NettyInboundSecurityHandlerSplitPacketTest {
         setField(inboundSecurityHandler, "userRateLimiterOperate", userRateLimiterOperate);
 
         when(localGlobalRateLimiter.tryAcquire()).thenReturn(true);
-        when(localBanCache.getUserBanInfo(anyLong())).thenReturn(null);
-        when(userRateLimiterOperate.acquire0GcUid(anyLong(), any())).thenReturn(true);
+        when(localBanCache.isUserBanned(anyLong())).thenReturn(false);
     }
 
     private void setField(Object target, String fieldName, Object value) {

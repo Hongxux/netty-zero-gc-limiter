@@ -39,6 +39,10 @@ public class GatewayRateLimitConfigListener implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
+        if (properties.getJwtSecret() != null) {
+            com.netty.limiter.util.jwt.JwtAuthenticator.updateSecretKey(properties.getJwtSecret());
+        }
+
         if (serverAddr == null || serverAddr.isEmpty()) {
             log.info("Nacos serverAddr is empty. Using local properties for rate limiter.");
             localGlobalRateLimiter.updateConfig(properties.getGlobalQps(), properties.getFillRate());
@@ -79,8 +83,18 @@ public class GatewayRateLimitConfigListener implements CommandLineRunner {
                 Integer qps = json.getInteger("globalQps");
                 Integer fillRate = json.getInteger("fillRate");
                 if (qps != null && fillRate != null) {
-                    localGlobalRateLimiter.updateConfig(qps, fillRate);
-                    log.info("Successfully updated LocalGlobalRateLimiter config from Nacos: QPS={}, fillRate={}", qps, fillRate);
+                    if (qps > 0 && fillRate > 0) {
+                        localGlobalRateLimiter.updateConfig(qps, fillRate);
+                        log.info("Successfully updated LocalGlobalRateLimiter config from Nacos: QPS={}, fillRate={}", qps, fillRate);
+                    } else {
+                        log.warn("Ignored invalid Nacos rate limit config parameters: globalQps={}, fillRate={}. Values must be positive (> 0).", qps, fillRate);
+                    }
+                }
+
+                String jwtSecret = json.getString("jwtSecret");
+                if (jwtSecret != null && !jwtSecret.trim().isEmpty()) {
+                    com.netty.limiter.util.jwt.JwtAuthenticator.updateSecretKey(jwtSecret);
+                    log.info("Successfully rotated JWT Secret Key from Nacos config.");
                 }
             }
         } catch (Exception e) {

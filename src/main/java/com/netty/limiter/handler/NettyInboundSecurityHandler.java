@@ -58,22 +58,23 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
                 return;
             }
 
-            // 防线 2: JWT Header 0-GC 极速解析与 UID 黑名单检查 (针对 JWT，从当前 readerIndex 直接探查)
-            LocalBanCache.BanInfo banInfo = jwtHeaderSecurityHandler.authenticateJwtAndCheckBan(downstreamBuf, ctx, localBanCache);
-            if (banInfo != null) {
-                boolean isInvalidJwt = (banInfo == JwtHeaderSecurityHandler.INVALID_JWT_BAN);
+            // 防线 2: JWT Header 0-GC 极速解析与 UID 黑名单检查 (原生 int 状态码，0 堆内存分配)
+            int banStatus = jwtHeaderSecurityHandler.authenticateJwtAndCheckBanStatus(downstreamBuf, ctx, localBanCache);
+            if (banStatus != JwtHeaderSecurityHandler.STATUS_PASSED) {
+                boolean isInvalidJwt = (banStatus == JwtHeaderSecurityHandler.STATUS_INVALID_JWT);
                 int statusCode = isInvalidJwt ? 401 : 403;
                 ByteBuf responseBuf = isInvalidJwt ? SecurityResponses.RESPONSE_401 : SecurityResponses.RESPONSE_403;
 
                 if (isInvalidJwt) {
                     // 如果识别到非法/畸形/已过期的 JWT 攻击，自动将客户端 IP 加入本地黑名单并关闭连接
-                    String clientIp = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IP).get();
-                    if (clientIp != null && !clientIp.isEmpty()) {
+                    Long ip4 = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV4_LONG).get();
+                    if (ip4 != null && ip4 != 0) {
+                        String clientIp = com.netty.limiter.util.ZeroGcNumberUtil.formatIpToString(ip4);
                         localBanCache.putBanInfo(clientIp, "Banned due to Invalid JWT Attack", 300);
                     }
                 }
 
-                rejectAndRelease(ctx, downstreamBuf, statusCode, responseBuf, banInfo.getMessage());
+                rejectAndRelease(ctx, downstreamBuf, statusCode, responseBuf, isInvalidJwt ? "Invalid or Expired JWT Token" : "User is in local ban list");
                 return;
             }
 
@@ -105,9 +106,10 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
 
     private void notifyListener(ChannelHandlerContext ctx, int code, String reason) {
         if (eventListener != null) {
-            String clientIp = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IP).get();
+            Long ip4 = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV4_LONG).get();
+            String clientIp = ip4 != null && ip4 != 0 ? com.netty.limiter.util.ZeroGcNumberUtil.formatIpToString(ip4) : "";
             Long userId = ctx.channel().attr(SecurityAttributeKeys.USER_ID).get();
-            eventListener.onRateLimitTriggered(clientIp != null ? clientIp : "", userId != null ? userId : 0L, code, reason);
+            eventListener.onRateLimitTriggered(clientIp, userId != null ? userId : 0L, code, reason);
         }
     }
 

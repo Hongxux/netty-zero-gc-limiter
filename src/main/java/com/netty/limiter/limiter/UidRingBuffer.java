@@ -125,9 +125,15 @@ public class UidRingBuffer implements AutoCloseable {
 
         long offset = offset(currentNeededAckSeq);
         long uid;
-        // 生产者已 CAS 推进 nextAvailableRequestSequence (预占)，使用 Thread.onSpinWait() 极短自旋等待 Producer 完成写屏障发布
+        int spinCount = 0;
+        // 🛡️ 防死锁自旋阈值：如果生产者 CAS 预占后中途崩溃，10,000 次 Spin 后超时跳过，防止 Consumer 永久死循环
         while ((uid = UNSAFE.getLongVolatile(null, offset)) == 0L) {
             Thread.onSpinWait();
+            if (++spinCount > 10_000) {
+                UNSAFE.putLongVolatile(null, offset, 0L);
+                NEXT_NEEDED_ACK_SEQUENCE_HANDLE.setRelease(this, currentNeededAckSeq + 1);
+                return 0L;
+            }
         }
 
         UNSAFE.putLongVolatile(null, offset, 0L); // 清空槽位供下次使用
@@ -176,19 +182,29 @@ public class UidRingBuffer implements AutoCloseable {
         if (countToFetch <= 0) {
             return 0;
         }
+        int fetched = 0;
         for (int i = 0; i < countToFetch; i++) {
             long offset = offset(currentNeededAckSeq + i);
             long uid;
+            int spinCount = 0;
+            // 🛡️ 防死锁自旋保护：最多自旋 10,000 次，若生产者中途崩溃，跳过坏槽位
             while ((uid = UNSAFE.getLongVolatile(null, offset)) == 0L) {
                 Thread.onSpinWait();
+                if (++spinCount > 10_000) {
+                    break;
+                }
             }
-            dst[i] = uid;
-            UNSAFE.putLongVolatile(null, offset, 0L); // 清空槽位供下次复用——作为边界哨兵
+            if (uid != 0L) {
+                dst[fetched++] = uid;
+                UNSAFE.putLongVolatile(null, offset, 0L); // 清空槽位供下次复用
+            } else {
+                UNSAFE.putLongVolatile(null, offset, 0L);
+            }
         }
         this.lastFlushNanos = now;
         // 整个 Batch 提取完毕后仅触发 1 次 setRelease 写屏障 (屏障开销稀释 countToFetch 倍)
         NEXT_NEEDED_ACK_SEQUENCE_HANDLE.setRelease(this, currentNeededAckSeq + countToFetch);
-        return countToFetch;
+        return fetched;
     }
 
     /**

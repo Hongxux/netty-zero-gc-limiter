@@ -9,9 +9,15 @@ import io.netty.util.AttributeKey;
 public class SecurityAttributeKeys {
 
     /**
-     * 极速解析出的客户端 IP
+     * 0-GC 极速解析出的客户端 IPv4 地址 (primitive long)
      */
-    public static final AttributeKey<String> CLIENT_IP = AttributeKey.valueOf("NETTY_LIMITER_CLIENT_IP");
+    public static final AttributeKey<Long> CLIENT_IPV4_LONG = AttributeKey.valueOf("NETTY_LIMITER_CLIENT_IPV4_LONG");
+
+    /**
+     * 0-GC 极速解析出的客户端 IPv6 地址 (128-bit 双 Long 原生存储)
+     */
+    public static final AttributeKey<Long> CLIENT_IPV6_HIGH = AttributeKey.valueOf("NETTY_LIMITER_CLIENT_IPV6_HIGH");
+    public static final AttributeKey<Long> CLIENT_IPV6_LOW = AttributeKey.valueOf("NETTY_LIMITER_CLIENT_IPV6_LOW");
 
     /**
      * 极速解析出的 User ID (primitive long)

@@ -79,12 +79,17 @@ public class JwtHeaderSecurityHandler {
         return false;
     }
 
-    public static final LocalBanCache.BanInfo INVALID_JWT_BAN = new LocalBanCache.BanInfo("Invalid or Expired JWT Token", Long.MAX_VALUE);
+    public static final int STATUS_PASSED = 0;
+    public static final int STATUS_USER_BANNED = 1;
+    public static final int STATUS_INVALID_JWT = 2;
 
-    public LocalBanCache.BanInfo authenticateJwtAndCheckBan(ByteBuf buf, ChannelHandlerContext ctx, LocalBanCache localBanCache) {
+    /**
+     * 🚀 100% 0-GC JWT 物理签名鉴权与 UID 黑名单校验 (返回原生 int 状态码: 0=通过, 1=黑名单, 2=非法JWT)
+     */
+    public int authenticateJwtAndCheckBanStatus(ByteBuf buf, ChannelHandlerContext ctx, LocalBanCache localBanCache) {
         Long cachedUserId = ctx != null ? ctx.channel().attr(SecurityAttributeKeys.USER_ID).get() : null;
         if (cachedUserId != null && cachedUserId > 0) {
-            return localBanCache.getUserBanInfo(cachedUserId);
+            return localBanCache.isUserBanned(cachedUserId) ? STATUS_USER_BANNED : STATUS_PASSED;
         }
 
         int lineStart = buf.readerIndex();
@@ -92,7 +97,7 @@ public class JwtHeaderSecurityHandler {
 
         int lineEnd = findLineEnd(buf, lineStart, limit);
         if (lineEnd == limit) {
-            return null;
+            return STATUS_PASSED;
         }
 
         int colonPos = findColon(buf, lineStart, lineEnd);
@@ -106,14 +111,14 @@ public class JwtHeaderSecurityHandler {
                 if (ctx != null) {
                     ctx.channel().attr(SecurityAttributeKeys.USER_ID).set(userId);
                 }
-                return localBanCache.getUserBanInfo(userId);
+                return localBanCache.isUserBanned(userId) ? STATUS_USER_BANNED : STATUS_PASSED;
             } else {
-                // JWT 校验失败 (返回 0L，代表非法签名/畸形/已过期)，直接返回 INVALID_JWT_BAN 哨兵对象触发拦截！
-                return INVALID_JWT_BAN;
+                // JWT 校验失败 (返回 0L，代表非法签名/畸形/已过期)，返回 STATUS_INVALID_JWT 触发 401 拦截
+                return STATUS_INVALID_JWT;
             }
         }
 
-        return null;
+        return STATUS_PASSED;
     }
 
     private static boolean isCandidateJwtFirstByte(byte b) {

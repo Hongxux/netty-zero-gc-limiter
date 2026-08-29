@@ -77,6 +77,32 @@ public class LocalBanCache {
         EXPIRES_HANDLE.setRelease(uidExpires, baseIndex, expireTime);
     }
 
+    /**
+     * 🚀 100% 0-GC 扁平数组线性探查判断 UID 是否被封禁 (零 Heap 堆内存分配)
+     */
+    public boolean isUserBanned(long userId) {
+        if (userId <= 0) {
+            return false;
+        }
+        int baseIndex = (int) (mixHash(userId) & MASK);
+        long now = System.currentTimeMillis();
+
+        for (int i = 0; i < MAX_PROBE; i++) {
+            int index = (baseIndex + i) & MASK;
+            long storedUid = (long) KEYS_HANDLE.getAcquire(uidKeys, index);
+
+            if (storedUid == userId) {
+                long expireTime = (long) EXPIRES_HANDLE.getAcquire(uidExpires, index);
+                return expireTime > now;
+            }
+
+            if (storedUid == 0L) {
+                return false;
+            }
+        }
+        return false;
+    }
+
     public BanInfo getUserBanInfo(long userId) {
         if (userId <= 0) {
             return null;
@@ -98,7 +124,6 @@ public class LocalBanCache {
             }
 
             if (storedUid == 0L) {
-                // 遇到空槽位停止探查
                 return null;
             }
         }

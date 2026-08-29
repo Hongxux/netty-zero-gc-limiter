@@ -41,6 +41,10 @@ public class LocalGlobalRateLimiter {
     }
 
     public void updateConfig(int newCapacity, int newTokensPerSec) {
+        if (newCapacity <= 0 || newTokensPerSec <= 0) {
+            log.warn("Rejected invalid rate limiter config update: capacity={}, fillRate={}. Values must be positive (> 0).", newCapacity, newTokensPerSec);
+            return;
+        }
         if (this.globalTokenBucket != null) {
             this.globalTokenBucket.updateConfig(newCapacity, newTokensPerSec);
         }

@@ -152,9 +152,10 @@ public class NettyJwtHeaderAccumulatorHandler extends ChannelDuplexHandler {
     private void notifyListener(ChannelHandlerContext ctx, int code, String reason) {
         if (eventListener != null) {
             try {
-                String clientIp = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IP).get();
+                Long ip4 = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV4_LONG).get();
+                String clientIp = ip4 != null && ip4 != 0 ? com.netty.limiter.util.ZeroGcNumberUtil.formatIpToString(ip4) : "";
                 Long userId = ctx.channel().attr(SecurityAttributeKeys.USER_ID).get();
-                eventListener.onRateLimitTriggered(clientIp != null ? clientIp : "", userId != null ? userId : 0L, code, reason);
+                eventListener.onRateLimitTriggered(clientIp, userId != null ? userId : 0L, code, reason);
             } catch (Exception e) {
                 log.error("Failed to notify RateLimitEventListener", e);
             }

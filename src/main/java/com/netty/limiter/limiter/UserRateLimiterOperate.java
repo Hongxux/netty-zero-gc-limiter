@@ -50,6 +50,10 @@ public class UserRateLimiterOperate {
         return luaShaBytes;
     }
 
+    public EventLoopGroup getEventLoopGroup() {
+        return eventLoopGroup;
+    }
+
     private volatile Channel redisChannel;
     private EventLoopGroup eventLoopGroup;
     private final AtomicBoolean reconnecting = new AtomicBoolean(false);

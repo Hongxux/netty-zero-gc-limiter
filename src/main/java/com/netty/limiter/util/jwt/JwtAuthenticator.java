@@ -1,6 +1,7 @@
 package com.netty.limiter.util.jwt;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.util.concurrent.FastThreadLocal;
 
 import javax.crypto.Mac;
 import javax.crypto.ShortBufferException;
@@ -9,29 +10,74 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 
 /**
- * @description: 0-GC 极速 HMAC-SHA256 JWT 物理签名鉴权器 (SWAR 64-bit SIMD 字节比对)
+ * @description: 0-GC 极速 HMAC-SHA256 JWT 物理签名鉴权器 (SWAR 64-bit SIMD 字节比对 + FastThreadLocal)
  * 绝对 0 堆内存分配 (Zero Heap Allocation)：
- * 1. 利用 ThreadLocal 重用 Mac 实例与 32 字节 / 64 字节摘要/ Base64URL 字符数组。
+ * 1. 利用 FastThreadLocal 数组索引 O(1) 访问重用 Mac 实例与 32 字节 / 64 字节摘要 / Base64URL 缓冲区。
  * 2. 通过 buf.nioBuffer() 零拷贝获取内存视图注入 CPU 哈希引擎。
  * 3. 采用 SWAR (SIMD) 64-bit Word 级位运算进行 Constant-Time 防侧信道攻击比对。
  **/
 public class JwtAuthenticator {
 
-    private static final byte[] DEFAULT_SECRET_KEY = "damai-seckill-secret".getBytes(StandardCharsets.UTF_8);
-    private static final SecretKeySpec SECRET_KEY_SPEC = new SecretKeySpec(DEFAULT_SECRET_KEY, "HmacSHA256");
+    private static final byte[] DEFAULT_SECRET_KEY = "secret".getBytes(StandardCharsets.UTF_8);
+    private static volatile SecretKeySpec CURRENT_SECRET_KEY_SPEC = new SecretKeySpec(DEFAULT_SECRET_KEY, "HmacSHA256");
+    private static volatile long SECRET_KEY_VERSION = 1L;
 
-    private static final ThreadLocal<Mac> HMAC_SHA256_HOLDER = ThreadLocal.withInitial(() -> {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(SECRET_KEY_SPEC);
-            return mac;
-        } catch (Exception e) {
-            throw new IllegalStateException("Failed to initialize HMAC-SHA256 Mac instance", e);
+    /**
+     * 🚀 物理级 JWT 密钥无缝轮换 (支持运行时从 Spring / Nacos 配置中心拉取并无缝切换 Secret Key)
+     */
+    public static void updateSecretKey(String secretKey) {
+        if (secretKey != null && !secretKey.trim().isEmpty()) {
+            byte[] keyBytes = secretKey.trim().getBytes(StandardCharsets.UTF_8);
+            CURRENT_SECRET_KEY_SPEC = new SecretKeySpec(keyBytes, "HmacSHA256");
+            SECRET_KEY_VERSION++;
         }
-    });
+    }
 
-    private static final ThreadLocal<byte[]> DIGEST_BUFFER_HOLDER = ThreadLocal.withInitial(() -> new byte[32]);
-    private static final ThreadLocal<byte[]> BASE64URL_BUFFER_HOLDER = ThreadLocal.withInitial(() -> new byte[64]);
+    private static class MacHolderWrapper {
+        final Mac mac;
+        long keyVersion;
+
+        MacHolderWrapper(Mac mac, long keyVersion) {
+            this.mac = mac;
+            this.keyVersion = keyVersion;
+        }
+    }
+
+    private static final FastThreadLocal<MacHolderWrapper> HMAC_SHA256_HOLDER = new FastThreadLocal<MacHolderWrapper>() {
+        @Override
+        protected MacHolderWrapper initialValue() {
+            try {
+                Mac mac = Mac.getInstance("HmacSHA256");
+                SecretKeySpec keySpec = CURRENT_SECRET_KEY_SPEC;
+                long ver = SECRET_KEY_VERSION;
+                mac.init(keySpec);
+                return new MacHolderWrapper(mac, ver);
+            } catch (Exception e) {
+                throw new IllegalStateException("Failed to initialize HMAC-SHA256 Mac instance", e);
+            }
+        }
+    };
+
+    private static final FastThreadLocal<byte[]> DIGEST_BUFFER_HOLDER = new FastThreadLocal<byte[]>() {
+        @Override
+        protected byte[] initialValue() {
+            return new byte[32];
+        }
+    };
+
+    private static final FastThreadLocal<byte[]> BASE64URL_BUFFER_HOLDER = new FastThreadLocal<byte[]>() {
+        @Override
+        protected byte[] initialValue() {
+            return new byte[64];
+        }
+    };
+
+    private static final FastThreadLocal<byte[]> JWT_CONTENT_BUFFER_HOLDER = new FastThreadLocal<byte[]>() {
+        @Override
+        protected byte[] initialValue() {
+            return new byte[2048]; // 预分配 2KB 线程池共享 Byte 数组，绝对 0 堆分配
+        }
+    };
 
     private static final byte[] BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".getBytes(StandardCharsets.UTF_8);
 
@@ -45,11 +91,26 @@ public class JwtAuthenticator {
             return false;
         }
 
-        Mac mac = HMAC_SHA256_HOLDER.get();
+        byte[] contentBuf = JWT_CONTENT_BUFFER_HOLDER.get();
+        if (contentLen > contentBuf.length) {
+            return false;
+        }
+
+        MacHolderWrapper wrapper = HMAC_SHA256_HOLDER.get();
+        Mac mac = wrapper.mac;
+        if (wrapper.keyVersion != SECRET_KEY_VERSION) {
+            try {
+                mac.init(CURRENT_SECRET_KEY_SPEC);
+                wrapper.keyVersion = SECRET_KEY_VERSION;
+            } catch (Exception e) {
+                return false;
+            }
+        }
         mac.reset();
 
-        ByteBuffer nioBuffer = buf.nioBuffer(jwtStart, contentLen);
-        mac.update(nioBuffer);
+        // 🚀 彻底消除 ByteBuf.nioBuffer() 带来的 ByteBuffer 包装对象分配，100% 0-GC 拷贝至 FastThreadLocal 数组
+        buf.getBytes(jwtStart, contentBuf, 0, contentLen);
+        mac.update(contentBuf, 0, contentLen);
 
         byte[] digestBuf = DIGEST_BUFFER_HOLDER.get();
         try {

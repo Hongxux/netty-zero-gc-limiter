@@ -47,4 +47,9 @@ public class GatewayRateLimitProperties {
      */
     private String redisHost = "127.0.0.1";
     private Integer redisPort = 6379;
+
+    /**
+     * HMAC-SHA256 JWT 物理签名密钥 (支持配置文件指定与配置中心热轮载)
+     */
+    private String jwtSecret = "secret";
 }

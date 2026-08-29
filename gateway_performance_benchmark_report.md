@@ -18,8 +18,8 @@
 * **报文尺寸**: 统一为 512 Bytes / Request (包含完整 Header 与空 Body)。
 * **Header 构造**:
   ```http
-  GET /api/v1/ticket/seckill HTTP/1.1\r\n
-  Host: gateway.damai.cn\r\n
+  GET /api/v1/resource HTTP/1.1\r\n
+  Host: gateway.example.com\r\n
   User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n
   Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...\r\n
   X-Forwarded-For: 183.14.21.88\r\n
@@ -53,7 +53,7 @@
 ### 3. 工具链与 Profiling 配置 (Toolchain Configuration)
 
 * **HTTP 压测引擎**: `wrk2` (相比传统 wrk，wrk2 支持恒定 QPS 发包，修正了“协调遗漏 (Coordinated Omission)”造成的 Latency 采样偏差)。
-  * 命令配置: `wrk -t32 -c1024 -d300s -R200000 --latency http://10.0.1.20:8080/api/v1/ticket/seckill`
+  * 命令配置: `wrk -t32 -c1024 -d300s -R200000 --latency http://10.0.1.20:8080/api/v1/resource`
 * **JVM 微基准测试**: `JMH` (Java Microbenchmark Harness 1.35)，采样模式 `Throughput` 与 `SampleTime`，Warmup 5 次，Measurement 10 次。
 * **GC 与内存分配剖析**: `Async-profiler 2.9`
   * CPU 采样: `./profiler.sh -e cpu -d 60 -f cpu_profile.html <pid>`
@@ -115,7 +115,7 @@ ZeroGcJwtParserBenchmark.testZeroGcParser:gc.alloc.rate.norm  thrpt   10       0
 ```bash
 java -server -Xms8g -Xmx8g -XX:+UseG1GC -XX:MaxGCPauseMillis=20 \
      -Xlog:gc*,gc+phases=debug:file=/var/log/gateway/gc.log:time,uptime,pid:filecount=5,filesize=100m \
-     -jar damai-gateway-service.jar
+     -jar netty-limiter-gateway-service.jar
 ```
 
 #### ② 真实 GC 日志文本对比 (GC Log Snippets)

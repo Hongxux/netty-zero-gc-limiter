@@ -12,7 +12,7 @@ public class LuaSha1Util {
     private static final byte[] HEX_DIGITS = "0123456789abcdef".getBytes(StandardCharsets.US_ASCII);
 
     /**
-     * 网关默认 Per-UID 令牌桶 Lua 脚本
+     * 网关默认 Per-UID 令牌桶 Lua 脚本 (Fast Path 优先扣减 + 惰性回填 + 超限 PubSub 黑名单广播)
      */
     public static final String DEFAULT_LUA_SCRIPT =
             "local key = KEYS[1]\n" +
@@ -30,19 +30,30 @@ public class LuaSha1Util {
             "        last_time_ms = tonumber(string.sub(data, 1, sep - 1)) or now_ms\n" +
             "        tokens = tonumber(string.sub(data, sep + 1)) or max_tokens\n" +
             "    end\n" +
-            "    local delta_sec = math.max(0, (now_ms - last_time_ms) / 1000.0)\n" +
-            "    tokens = math.min(max_tokens, tokens + (delta_sec * refill_rate))\n" +
             "end\n" +
-            "local granted = math.min(tokens, requested)\n" +
-            "if granted >= 1 then\n" +
-            "    tokens = tokens - granted\n" +
-            "    local new_data = tostring(now_ms) .. \":\" .. tostring(tokens)\n" +
-            "    redis.call('set', key, new_data)\n" +
+            "-- 🚀 1. Fast Path: 余量足够直接扣减，擦除浮点与时间开销\n" +
+            "if tokens >= requested then\n" +
+            "    tokens = tokens - requested\n" +
+            "    redis.call('set', key, tostring(now_ms) .. \":\" .. tostring(tokens))\n" +
             "    redis.call('expire', key, ttl_sec)\n" +
-            "    return math.floor(granted)\n" +
-            "else\n" +
-            "    return 0\n" +
-            "end";
+            "    return 1\n" +
+            "end\n" +
+            "-- 🚀 2. Slow Path: 令牌不足时按时间差惰性回填\n" +
+            "local delta_sec = math.max(0, (now_ms - last_time_ms) / 1000.0)\n" +
+            "if delta_sec > 0 then\n" +
+            "    tokens = math.min(max_tokens, tokens + (delta_sec * refill_rate))\n" +
+            "    last_time_ms = now_ms\n" +
+            "end\n" +
+            "-- 🚀 3. 回填后再次尝试扣减\n" +
+            "if tokens >= requested then\n" +
+            "    tokens = tokens - requested\n" +
+            "    redis.call('set', key, tostring(now_ms) .. \":\" .. tostring(tokens))\n" +
+            "    redis.call('expire', key, ttl_sec)\n" +
+            "    return 1\n" +
+            "end\n" +
+            "-- 🚀 4. 仍不足：触发限流并全网 Pub/Sub 广播黑名单\n" +
+            "redis.call('publish', 'NETTY_LIMITER_BAN_CHANNEL', tostring(key) .. ':' .. tostring(ttl_sec))\n" +
+            "return 0";
 
     /**
      * JVM 类加载 static 阶段即完成 40 字节 Hex SHA-1 计算 (0 堆内存分配，全局共享不可变 byte[])
