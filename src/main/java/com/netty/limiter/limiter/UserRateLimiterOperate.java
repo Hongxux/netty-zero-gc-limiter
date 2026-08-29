@@ -2,7 +2,6 @@ package com.netty.limiter.limiter;
 
 import com.netty.limiter.cache.LocalBanCache;
 import com.netty.limiter.config.GatewayRateLimitProperties;
-import com.netty.limiter.util.Resp2Encoder;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
@@ -43,6 +42,7 @@ public class UserRateLimiterOperate {
     private LocalBanCache localBanCache;
 
     private static final byte[] PING_CMD_BYTES = "*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] EVALSHA_CMD_PREFIX = "*4\r\n$7\r\nEVALSHA\r\n".getBytes(StandardCharsets.US_ASCII);
 
     private final byte[] luaShaBytes = com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES;
 
@@ -203,7 +203,7 @@ public class UserRateLimiterOperate {
         }
         ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(256);
         try {
-            Resp2Encoder.encodeResp2EvalSha(buf, luaShaBytes, userId);
+            encodeResp2EvalSha(buf, luaShaBytes, userId);
             redisChannel.writeAndFlush(buf);
         } catch (Exception e) {
             buf.release();
@@ -256,7 +256,7 @@ public class UserRateLimiterOperate {
         ByteBuf pipelineBuf = PooledByteBufAllocator.DEFAULT.directBuffer(count * 256);
         try {
             for (int i = 0; i < count; i++) {
-                Resp2Encoder.encodeResp2EvalSha(pipelineBuf, luaShaBytes, uids[i]);
+                encodeResp2EvalSha(pipelineBuf, luaShaBytes, uids[i]);
             }
             // 单次 Socket writeAndFlush 发送整个 Batch 命令
             redisChannel.writeAndFlush(pipelineBuf);
@@ -264,5 +264,37 @@ public class UserRateLimiterOperate {
             pipelineBuf.release();
             log.error("Failed to flush RESP2 batch pipeline for {} uids", count, e);
         }
+    }
+
+    /**
+     * 封装 RESP2 协议 EVALSHA 命令的 0-GC 快速序列化逻辑
+     */
+    private static void encodeResp2EvalSha(ByteBuf buf, byte[] luaShaBytes, long userId) {
+        buf.writeBytes(EVALSHA_CMD_PREFIX);
+
+        buf.writeByte('$');
+        com.netty.limiter.util.ZeroGcNumberUtil.writeLongToAsciiByteBuf(buf, luaShaBytes.length);
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+        buf.writeBytes(luaShaBytes);
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+
+        buf.writeByte('$');
+        buf.writeByte('1');
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+        buf.writeByte('1');
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+
+        int uidLen = com.netty.limiter.util.ZeroGcNumberUtil.getLongAsciiLength(userId);
+        buf.writeByte('$');
+        com.netty.limiter.util.ZeroGcNumberUtil.writeLongToAsciiByteBuf(buf, uidLen);
+        buf.writeByte('\r');
+        buf.writeByte('\n');
+        com.netty.limiter.util.ZeroGcNumberUtil.writeLongToAsciiByteBuf(buf, userId);
+        buf.writeByte('\r');
+        buf.writeByte('\n');
     }
 }
