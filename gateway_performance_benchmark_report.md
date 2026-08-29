@@ -1,5 +1,14 @@
 # 高性能网关限流与安全防线性能压测及量化收益报告 (Benchmark Datasets & Results)
 
+> **本次复核状态（2026-08-29）**：代码构建与非 Redis 测试已实际跑通；真实 Redis 压测未能在当前主机执行，因为 Docker Desktop Linux engine pipe 不可用（`//./pipe/dockerDesktopLinuxEngine` 不存在，backend 退出码 150）。因此本文后续历史数字不能视为本次实测结论，也没有被重新背书。请使用 `scripts/run-real-redis-validation.ps1` 在 Docker engine 正常的机器上生成 `target/perf-results/redis-limiter-comparison.csv` 后再填入 Redis 性能表。
+
+## 本次可复核证据
+
+- `mvn test`：15 个测试，0 failures，2 个真实 Redis 测试因 Redis 不可用而跳过；其余功能/微基准通过。
+- `mvn -DskipTests test-compile`：退出码 0。
+- `scripts/run-real-redis-validation.ps1`：按设计尝试创建 `redis:7.2-alpine`，因 Docker engine 不可达在 30 秒后失败；未使用内嵌假 Redis 产生性能数字。
+- 已修复并由 `UserRateLimiterOperateResp2Test` 覆盖的协议问题：原先错误的 `EVALSHA sha 1 uid` 改为完整 `EVALSHA sha 1 key now_ms max_tokens refill_rate ttl_sec requested`，并在连接建立时 `SCRIPT LOAD`。
+
 ## 一、 压测环境、测试数据集与工具链规格
 
 为了保证性能测试数据的**可复现性（Reproducibility）与工业级严谨性**，所有压测指标均基于严密的测试数据集样本、固定的流量模型以及专业调优后的工具链得出。

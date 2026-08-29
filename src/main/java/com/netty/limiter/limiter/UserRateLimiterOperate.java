@@ -42,7 +42,9 @@ public class UserRateLimiterOperate {
     private LocalBanCache localBanCache;
 
     private static final byte[] PING_CMD_BYTES = "*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.US_ASCII);
-    private static final byte[] EVALSHA_CMD_PREFIX = "*4\r\n$7\r\nEVALSHA\r\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] EVALSHA_CMD_PREFIX = "*8\r\n$7\r\nEVALSHA\r\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] SCRIPT_LOAD_PREFIX = "*3\r\n$6\r\nSCRIPT\r\n$4\r\nLOAD\r\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] CRLF = {'\r', '\n'};
 
     private final byte[] luaShaBytes = com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES;
 
@@ -166,6 +168,7 @@ public class UserRateLimiterOperate {
                 if (future.isSuccess()) {
                     redisChannel = ((io.netty.channel.ChannelFuture) future).channel();
                     reconnectAttempts = 0; // 重置重连计数
+                    loadDefaultScript();
                     log.info("Successfully connected/reconnected 0-GC RESP2 driver to Redis/Predixy [{}:{}]", host, port);
                 } else {
                     log.error("Failed to connect 0-GC RESP2 driver to Redis [{}:{}], attempt: {}", host, port, reconnectAttempts);
@@ -203,7 +206,8 @@ public class UserRateLimiterOperate {
         }
         ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(256);
         try {
-            encodeResp2EvalSha(buf, luaShaBytes, userId);
+            encodeResp2EvalSha(buf, luaShaBytes, userId,
+                    System.currentTimeMillis(), maxTokens(), refillRate(), ttlSeconds(), 1);
             redisChannel.writeAndFlush(buf);
         } catch (Exception e) {
             buf.release();
@@ -256,7 +260,8 @@ public class UserRateLimiterOperate {
         ByteBuf pipelineBuf = PooledByteBufAllocator.DEFAULT.directBuffer(count * 256);
         try {
             for (int i = 0; i < count; i++) {
-                encodeResp2EvalSha(pipelineBuf, luaShaBytes, uids[i]);
+                encodeResp2EvalSha(pipelineBuf, luaShaBytes, uids[i],
+                        System.currentTimeMillis(), maxTokens(), refillRate(), ttlSeconds(), 1);
             }
             // 单次 Socket writeAndFlush 发送整个 Batch 命令
             redisChannel.writeAndFlush(pipelineBuf);
@@ -269,32 +274,61 @@ public class UserRateLimiterOperate {
     /**
      * 封装 RESP2 协议 EVALSHA 命令的 0-GC 快速序列化逻辑
      */
-    private static void encodeResp2EvalSha(ByteBuf buf, byte[] luaShaBytes, long userId) {
+    private static void encodeResp2EvalSha(ByteBuf buf, byte[] luaShaBytes, long userId,
+                                           long nowMs, int maxTokens, int refillRate,
+                                           int ttlSec, int requested) {
         buf.writeBytes(EVALSHA_CMD_PREFIX);
+        writeBulkBytes(buf, luaShaBytes);
+        writeBulkLong(buf, 1);
+        writeBulkLong(buf, userId);
+        writeBulkLong(buf, nowMs);
+        writeBulkLong(buf, maxTokens);
+        writeBulkLong(buf, refillRate);
+        writeBulkLong(buf, ttlSec);
+        writeBulkLong(buf, requested);
+    }
 
-        buf.writeByte('$');
-        com.netty.limiter.util.ZeroGcNumberUtil.writeLongToAsciiByteBuf(buf, luaShaBytes.length);
-        buf.writeByte('\r');
-        buf.writeByte('\n');
-        buf.writeBytes(luaShaBytes);
-        buf.writeByte('\r');
-        buf.writeByte('\n');
+    private static void encodeResp2EvalSha(ByteBuf buf, byte[] luaShaBytes, long userId) {
+        encodeResp2EvalSha(buf, luaShaBytes, userId, System.currentTimeMillis(), 20, 20, 2, 1);
+    }
 
+    private static void writeBulkBytes(ByteBuf buf, byte[] value) {
         buf.writeByte('$');
-        buf.writeByte('1');
-        buf.writeByte('\r');
-        buf.writeByte('\n');
-        buf.writeByte('1');
-        buf.writeByte('\r');
-        buf.writeByte('\n');
+        com.netty.limiter.util.ZeroGcNumberUtil.writeLongToAsciiByteBuf(buf, value.length);
+        buf.writeBytes(CRLF);
+        buf.writeBytes(value);
+        buf.writeBytes(CRLF);
+    }
 
-        int uidLen = com.netty.limiter.util.ZeroGcNumberUtil.getLongAsciiLength(userId);
+    private static void writeBulkLong(ByteBuf buf, long value) {
         buf.writeByte('$');
-        com.netty.limiter.util.ZeroGcNumberUtil.writeLongToAsciiByteBuf(buf, uidLen);
-        buf.writeByte('\r');
-        buf.writeByte('\n');
-        com.netty.limiter.util.ZeroGcNumberUtil.writeLongToAsciiByteBuf(buf, userId);
-        buf.writeByte('\r');
-        buf.writeByte('\n');
+        com.netty.limiter.util.ZeroGcNumberUtil.writeLongToAsciiByteBuf(buf,
+                com.netty.limiter.util.ZeroGcNumberUtil.getLongAsciiLength(value));
+        buf.writeBytes(CRLF);
+        com.netty.limiter.util.ZeroGcNumberUtil.writeLongToAsciiByteBuf(buf, value);
+        buf.writeBytes(CRLF);
+    }
+
+    private int maxTokens() {
+        return properties != null && properties.getUidMaxPerSec() != null ? properties.getUidMaxPerSec() : 20;
+    }
+
+    private int refillRate() {
+        return maxTokens();
+    }
+
+    private int ttlSeconds() {
+        return 2;
+    }
+
+    private void loadDefaultScript() {
+        if (redisChannel == null || !redisChannel.isActive()) {
+            return;
+        }
+        byte[] script = com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SCRIPT.getBytes(StandardCharsets.UTF_8);
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(SCRIPT_LOAD_PREFIX.length + script.length + 16);
+        buf.writeBytes(SCRIPT_LOAD_PREFIX);
+        writeBulkBytes(buf, script);
+        redisChannel.writeAndFlush(buf);
     }
 }
