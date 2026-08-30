@@ -253,10 +253,21 @@ public class UserRateLimiterOperate {
             return false; // 🛡️ Fail-Open 降级拦截
         }
 
-        // ③ 同步阻塞等待 Netty ChannelRead 唤醒 (50ms 超时)
-        java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(50));
+        // ③ 同步阻塞等待 Netty ChannelRead 唤醒 (50ms 超时 + 虚假唤醒防护)
+        // 🛡️ 虚假唤醒防护：用 deadline while 循环包裹 parkNanos 是 Java 并发标准惯用法。
+        //    场景：上一次请求超时后 EventLoop 迟到唤醒并存入 permit，下一次 park 会被该 stale permit
+        //    立即唤醒导致 status=0 误判。while 循环在第一次迭代消耗 stale permit 后会再次 park，彻底解决虚假唤醒。
+        long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(50);
+        while (slot.status == 0) {
+            long remaining = deadlineNs - System.nanoTime();
+            if (remaining <= 0) {
+                break; // 真正超时退出
+            }
+            java.util.concurrent.locks.LockSupport.parkNanos(remaining);
+            // 若因 stale permit 立即返回：status 仍为 0，deadline 未到，继续自旋等待真实唤醒
+        }
 
-        // status plain 读：HB 由 unpark → park 链保证（park 返回后必然看到 unpark 前的 status 写入）
+        // status plain 读：HB 由 unpark → park Happens-Before 链保证
         int result = slot.status;
         // 🎯 无需 slot.clear()：FTL Slot 在下次 offer() 时由本线程自己覆写字段，ZERO_SLOT 已由 poll() COW 原子清空
         if (result == 0) {
