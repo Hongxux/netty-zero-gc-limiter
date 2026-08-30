@@ -9,7 +9,7 @@ import java.lang.invoke.VarHandle;
  * 
  * 【体系结构级微观物理优化】：
  * 1. 56 字节 Cache Line 物理隔离: 彻底切断 Single-Consumer (Netty EventLoop) 与 Multi-Producer (网关请求线程) 间的 Cache Line 伪共享 (False Sharing)。
- * 2. Safe Zone 惰性读写指针 (cachedHead / cachedTail): 优先只读本地 L1 Cache，仅在临界满/空时触发 1 次跨核 Bus Sniffing 嗅探。
+ * 2. Safe Zone 惰性读写序列号 (cachedNextNeededAckSequence / cachedNextAvailableRequestSequence): 优先只读本地 L1 Cache，仅在临界满/空时触发 1 次跨核 Bus Sniffing 嗅探。
  * 3. 0-GC 预分配槽位数组: 槽位实例在构造时一次性预分配，只重置状态字段，彻底消除 JVM 堆内存 Node 开销。
  * =========================================================================================
  */
@@ -18,10 +18,10 @@ abstract class SyncWaitSlotRingBufferPad0 {
 }
 
 abstract class SyncWaitSlotRingBufferConsumerFields extends SyncWaitSlotRingBufferPad0 {
-    // head: 消费者 (Netty EventLoop) 读取已完成槽位的出队指针
-    protected long head = 0;
-    // cachedTail: 消费者本地 Safe Zone 缓存的生产者入队指针 (普通 long，无需跨核嗅探)
-    protected long cachedTail = 0;
+    // nextNeededAckSequence: 消费者 (Netty EventLoop) 下一个急需 ACK 出队的序列号 (非 volatile，由 VarHandle 语义控制)
+    protected long nextNeededAckSequence = 0;
+    // cachedNextAvailableRequestSequence: 消费者本地 Safe Zone 缓存的生产者请求序列号 (普通 long，无需跨核嗅探)
+    protected long cachedNextAvailableRequestSequence = 0;
 }
 
 abstract class SyncWaitSlotRingBufferPad1 extends SyncWaitSlotRingBufferConsumerFields {
@@ -29,10 +29,10 @@ abstract class SyncWaitSlotRingBufferPad1 extends SyncWaitSlotRingBufferConsumer
 }
 
 abstract class SyncWaitSlotRingBufferProducerFields extends SyncWaitSlotRingBufferPad1 {
-    // tail: 生产者 (网关请求线程) 入队申请的指针 (CAS 预占)
-    protected long tail = 0;
-    // cachedHead: 生产者本地 Safe Zone 缓存的消费者出队指针 (普通 long)
-    protected long cachedHead = 0;
+    // nextAvailableRequestSequence: 生产者 (网关请求线程) 下一个可申请/预占的请求序列号 (非 volatile，由 VarHandle 语义控制)
+    protected long nextAvailableRequestSequence = 0;
+    // cachedNextNeededAckSequence: 生产者本地 Safe Zone 缓存的消费者确认序列号 (普通 long)
+    protected long cachedNextNeededAckSequence = 0;
 }
 
 abstract class SyncWaitSlotRingBufferPad2 extends SyncWaitSlotRingBufferProducerFields {
@@ -56,14 +56,14 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     private final SyncWaitSlot[] array;
     private final int mask;
 
-    private static final VarHandle HEAD_HANDLE;
-    private static final VarHandle TAIL_HANDLE;
+    private static final VarHandle NEXT_NEEDED_ACK_SEQUENCE_HANDLE;
+    private static final VarHandle NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE;
 
     static {
         try {
             MethodHandles.Lookup l = MethodHandles.lookup();
-            HEAD_HANDLE = l.findVarHandle(SyncWaitSlotRingBuffer.class, "head", long.class);
-            TAIL_HANDLE = l.findVarHandle(SyncWaitSlotRingBuffer.class, "tail", long.class);
+            NEXT_NEEDED_ACK_SEQUENCE_HANDLE = l.findVarHandle(SyncWaitSlotRingBuffer.class, "nextNeededAckSequence", long.class);
+            NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE = l.findVarHandle(SyncWaitSlotRingBuffer.class, "nextAvailableRequestSequence", long.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -80,66 +80,66 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     }
 
     /**
-     * MPSC 生产者多线程 CAS 申请槽位 (Safe Zone 本地 cachedHead 保护)
+     * MPSC 生产者多线程 CAS 预占下一个可用请求槽位入队 (Safe Zone 本地 cachedNextNeededAckSequence 保护)
      */
     public SyncWaitSlot offer(long uid, Thread thread) {
-        long currentTail;
+        long currentAvailableReqSeq;
         do {
-            currentTail = (long) TAIL_HANDLE.getAcquire(this);
-            if (isFull(currentTail)) {
-                return null; // 缓冲区满， Fail-Open 降级处理
+            currentAvailableReqSeq = (long) NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.getAcquire(this);
+            if (isFull(currentAvailableReqSeq)) {
+                return null; // 缓冲区满，Fail-Open 降级处理
             }
-        } while (!TAIL_HANDLE.compareAndSet(this, currentTail, currentTail + 1));
+        } while (!NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.compareAndSet(this, currentAvailableReqSeq, currentAvailableReqSeq + 1));
 
-        int index = (int) (currentTail & mask);
+        int index = (int) (currentAvailableReqSeq & mask);
         SyncWaitSlot slot = array[index];
         slot.reset(uid, thread);
         return slot;
     }
 
-    private boolean isFull(long currentTail) {
-        if (currentTail - this.cachedHead >= array.length) {
-            long freshHead = (long) HEAD_HANDLE.getAcquire(this);
-            if (currentTail - freshHead >= array.length) {
+    private boolean isFull(long currentAvailableReqSeq) {
+        if (currentAvailableReqSeq - this.cachedNextNeededAckSequence >= array.length) {
+            long freshNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
+            if (currentAvailableReqSeq - freshNeededAckSeq >= array.length) {
                 return true;
             }
-            this.cachedHead = freshHead;
+            this.cachedNextNeededAckSequence = freshNeededAckSeq;
         }
         return false;
     }
 
     /**
-     * SPSC 单消费者 (Netty EventLoop) 查看队头等待槽位 (Safe Zone 本地 cachedTail 保护)
+     * SPSC 单消费者 (Netty EventLoop) 查看队头等待槽位 (Safe Zone 本地 cachedNextAvailableRequestSequence 保护)
      */
     public SyncWaitSlot peek() {
-        long currentHead = (long) HEAD_HANDLE.getAcquire(this);
-        if (isEmpty(currentHead)) {
+        long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
+        if (isEmpty(currentNeededAckSeq)) {
             return null;
         }
-        return array[(int) (currentHead & mask)];
+        return array[(int) (currentNeededAckSeq & mask)];
     }
 
     /**
-     * SPSC 单消费者 (Netty EventLoop) 弹出队头槽位并推进 head 指针
+     * SPSC 单消费者 (Netty EventLoop) 弹出队头槽位并推进 nextNeededAckSequence 序列号
      */
     public SyncWaitSlot poll() {
-        long currentHead = (long) HEAD_HANDLE.getAcquire(this);
-        if (isEmpty(currentHead)) {
+        long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
+        if (isEmpty(currentNeededAckSeq)) {
             return null;
         }
-        int index = (int) (currentHead & mask);
+        int index = (int) (currentNeededAckSeq & mask);
         SyncWaitSlot slot = array[index];
-        HEAD_HANDLE.setRelease(this, currentHead + 1);
+        NEXT_NEEDED_ACK_SEQUENCE_HANDLE.setRelease(this, currentNeededAckSeq + 1);
         return slot;
     }
 
-    private boolean isEmpty(long currentHead) {
-        if (currentHead >= this.cachedTail) {
-            long freshTail = (long) TAIL_HANDLE.getAcquire(this);
-            if (currentHead >= freshTail) {
+    private boolean isEmpty(long currentNeededAckSeq) {
+        if (currentNeededAckSeq >= this.cachedNextAvailableRequestSequence) {
+            long freshAvailableReqSeq = (long) NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.getAcquire(this);
+            if (currentNeededAckSeq >= freshAvailableReqSeq) {
                 return true;
             }
-            this.cachedTail = freshTail;
+            this.cachedNextAvailableRequestSequence = freshAvailableReqSeq;
         }
         return false;
     }
