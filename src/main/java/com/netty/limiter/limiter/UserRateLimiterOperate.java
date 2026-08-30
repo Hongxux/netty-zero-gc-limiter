@@ -150,8 +150,9 @@ public class UserRateLimiterOperate {
                                         // 🎯 返回的 UID 与队头等待槽位的 UID 精确匹配！
                                         syncWaitSlotRingBuffer.poll();
                                         expectedSlot.setStatusRelease((allowedFlag == 1) ? 1 : 2);
-                                        if (expectedSlot.waiterThread != null) {
-                                            java.util.concurrent.locks.LockSupport.unpark(expectedSlot.waiterThread);
+                                        Thread targetThread = expectedSlot.getWaiterThreadAcquire();
+                                        if (targetThread != null) {
+                                            java.util.concurrent.locks.LockSupport.unpark(targetThread);
                                         }
                                     }
                                     // 🛡️ 若 expectedSlot.getUserIdAcquire() != uidFromRedis (即属于模式 A 异步发送返回的数值)，直接跳过不唤醒！

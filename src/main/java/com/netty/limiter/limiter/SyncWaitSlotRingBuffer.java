@@ -10,8 +10,9 @@ import java.lang.invoke.VarHandle;
  * 【体系结构级微观物理优化与并发安全 Guarantee】：
  * 1. 56 字节 Cache Line 物理隔离: 彻底切断 Single-Consumer (Netty EventLoop) 与 Multi-Producer (网关请求线程) 间的 Cache Line 伪共享 (False Sharing)。
  * 2. Safe Zone 惰性读写序列号: 优先只读本地 L1 Cache，仅在临界满/空时触发 1 次跨核 Bus Sniffing 嗅探。
- * 3. VarHandle Acquire/Release 语义管理:
+ * 3. VarHandle Acquire/Release 语义管理与防旧线程污染:
  *    - 移除传统 volatile，全面使用 `VarHandle.setRelease` / `VarHandle.getAcquire` 严格约束 Store-Load / Release-Acquire 屏障。
+ *    - 针对 `waiterThread` 引入专用 VarHandle 内存控制，在 `reset` 时 `setRelease` 绑定新线程，在 `clear` 时 `setRelease(null)` 彻底清除残留引用，确保绝对不会误读/唤醒旧线程。
  *    - 生产者写入 `reset` 时以 `setRelease` 结束，保证前面的 status 与 waiterThread 写入对 Consumer 语义可见。
  *    - 消费者以 `getAcquire` 在有界自旋 (MAX_SPIN_COUNT = 4096 + Thread.onSpinWait) 中检测 `userId != 0L`。
  * =========================================================================================
@@ -53,13 +54,13 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
 
         public void reset(long uid, Thread thread) {
             this.status = 0;
-            this.waiterThread = thread;
+            WAITER_THREAD_HANDLE.setRelease(this, thread);
             // 🎯 VarHandle setRelease 内存屏障: 保证 status 和 waiterThread 的写入在 userId 非零发布前全量刷入 Cache
             USER_ID_HANDLE.setRelease(this, uid);
         }
 
         public void clear() {
-            this.waiterThread = null;
+            WAITER_THREAD_HANDLE.setRelease(this, null); // 🎯 明确清空等待线程引用，彻底防止残存旧线程指针
             STATUS_HANDLE.setRelease(this, 0);
             USER_ID_HANDLE.setRelease(this, 0L);
         }
@@ -75,6 +76,10 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         public void setStatusRelease(int st) {
             STATUS_HANDLE.setRelease(this, st);
         }
+
+        public Thread getWaiterThreadAcquire() {
+            return (Thread) WAITER_THREAD_HANDLE.getAcquire(this);
+        }
     }
 
     private final SyncWaitSlot[] array;
@@ -84,6 +89,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     private static final VarHandle NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE;
     private static final VarHandle USER_ID_HANDLE;
     private static final VarHandle STATUS_HANDLE;
+    private static final VarHandle WAITER_THREAD_HANDLE;
 
     static {
         try {
@@ -92,6 +98,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
             NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE = l.findVarHandle(SyncWaitSlotRingBuffer.class, "nextAvailableRequestSequence", long.class);
             USER_ID_HANDLE = l.findVarHandle(SyncWaitSlot.class, "userId", long.class);
             STATUS_HANDLE = l.findVarHandle(SyncWaitSlot.class, "status", int.class);
+            WAITER_THREAD_HANDLE = l.findVarHandle(SyncWaitSlot.class, "waiterThread", Thread.class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
