@@ -146,17 +146,20 @@ public class UserRateLimiterOperate {
                                     int allowedFlag = (statusByte == '1') ? 1 : 0;
 
                                     SyncWaitSlotRingBuffer.SyncWaitSlot expectedSlot = syncWaitSlotRingBuffer.peek();
-                                    // 🎯 peek() 内的 ARRAY_VH.getAcquire 已建立 HB，userId/waiterThread 均为可见 plain 字段
-                                    if (expectedSlot != null && expectedSlot.userId == uidFromRedis) {
-                                        syncWaitSlotRingBuffer.poll(); // COW 替换 ZERO_SLOT，原子清空槽位
-                                        // status plain 写：HB 由下方 unpark → park 链保证
-                                        expectedSlot.status = (allowedFlag == 1) ? 1 : 2;
-                                        Thread targetThread = expectedSlot.waiterThread; // plain 读，已通过 getAcquire 可见
-                                        if (targetThread != null) {
-                                            java.util.concurrent.locks.LockSupport.unpark(targetThread);
+                                    if (expectedSlot != null) {
+                                        if (expectedSlot == SyncWaitSlotRingBuffer.CANCELLED_SLOT) {
+                                            // 🎯 遇到 50ms 超时已取消的 Slot，出队 COW 替换 ZERO_SLOT，推进序列号，跳过唤醒！
+                                            syncWaitSlotRingBuffer.poll();
+                                        } else if (expectedSlot.userId == uidFromRedis) {
+                                            // 🎯 返回的 UID 与队头等待槽位的 UID 精确匹配！
+                                            syncWaitSlotRingBuffer.poll(); // COW 替换 ZERO_SLOT，原子清空槽位
+                                            expectedSlot.status = (allowedFlag == 1) ? 1 : 2;
+                                            Thread targetThread = expectedSlot.waiterThread;
+                                            if (targetThread != null) {
+                                                java.util.concurrent.locks.LockSupport.unpark(targetThread);
+                                            }
                                         }
                                     }
-                                    // 🛡️ 若 userId 不匹配 (模式 A 异步返回数值)，直接跳过不唤醒！
                                 }
 
                                 @Override
@@ -269,7 +272,14 @@ public class UserRateLimiterOperate {
 
         // status plain 读：HB 由 unpark → park Happens-Before 链保证
         int result = slot.status;
-        // 🎯 无需 slot.clear()：FTL Slot 在下次 offer() 时由本线程自己覆写字段，ZERO_SLOT 已由 poll() COW 原子清空
+        if (result == 0) {
+            // 🛡️ 超时处理：以 CAS 将 array[index] 中的 slot 原子替换为 CANCELLED_SLOT 哨兵
+            boolean cancelled = syncWaitSlotRingBuffer.cancel(slot);
+            if (!cancelled) {
+                // CAS 失败说明 EventLoop 恰好在超时一瞬间处理完并 poll() 了该 Slot，重新读取 status 避免误判
+                result = slot.status;
+            }
+        }
         if (result == 0) {
             return false; // 🛡️ Fail-Open 超时降级拦截
         }
