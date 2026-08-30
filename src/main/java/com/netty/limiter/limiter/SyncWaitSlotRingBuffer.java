@@ -5,14 +5,15 @@ import java.lang.invoke.VarHandle;
 
 /**
  * =========================================================================================
- * 🚀 0-GC 无锁高性能 SyncWaitSlot 环形缓冲区 (物理 Cache Line 伪共享隔离 + Safe Zone 缓存 + 序列号发布屏障)
+ * 🚀 0-GC 无锁高性能 SyncWaitSlot 环形缓冲区 (物理 Cache Line 伪共享隔离 + Safe Zone 缓存 + Clear-on-Consume 状态同步)
  * 
  * 【体系结构级微观物理优化与并发安全 Guarantee】：
  * 1. 56 字节 Cache Line 物理隔离: 彻底切断 Single-Consumer (Netty EventLoop) 与 Multi-Producer (网关请求线程) 间的 Cache Line 伪共享 (False Sharing)。
  * 2. Safe Zone 惰性读写序列号: 优先只读本地 L1 Cache，仅在临界满/空时触发 1 次跨核 Bus Sniffing 嗅探。
- * 3. 序列号发布屏障 (Slot Sequence Release Barrier):
- *    生产者 CAS 成功预占 `nextAvailableRequestSequence` 后，必须在完成槽位数据赋值后最后 volatile 写入 `slot.sequence`。
- *    消费者在 `peek` / `poll` 时校验 `slot.sequence == currentNeededAckSeq`，彻底消除 CAS 预占与槽位填充间极小时间窗口内的读写竞态！
+ * 3. Clear-on-Consume 0-GC 清空与自旋同步:
+ *    - 生产者 CAS 占位后写入 `userId != 0`，最后 volatile 触发填充通知。
+ *    - 消费者出队检测到 `userId == 0` 时利用 `Thread.onSpinWait()` 进行极短纳秒级自旋，直至数据就绪。
+ *    - 消费/超时处理完毕后调用 `slot.clear()` 将 `userId` 置为 0L，为环形缓冲区下一换代循环提供完美复用。
  * =========================================================================================
  */
 abstract class SyncWaitSlotRingBufferPad0 {
@@ -44,17 +45,22 @@ abstract class SyncWaitSlotRingBufferPad2 extends SyncWaitSlotRingBufferProducer
 public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
 
     public static class SyncWaitSlot {
-        public volatile long sequence = -1L; // 🎯 序列号发布屏障 (Publish Barrier)
-        public volatile long userId;
-        public volatile int status; // 0=pending, 1=passed, 2=blocked
+        public volatile long userId = 0L; // 0L 标识槽位为空/已被消费清空，非 0 标识已由生产者填充
+        public volatile int status;       // 0=pending, 1=passed, 2=blocked
         public volatile Thread waiterThread;
 
-        public void reset(long seq, long uid, Thread thread) {
-            this.userId = uid;
+        public void reset(long uid, Thread thread) {
             this.status = 0;
             this.waiterThread = thread;
-            // 🎯 最后 volatile 写入 sequence，作为 Release Barrier，保证 userId/waiterThread 对 Consumer 语义可见
-            this.sequence = seq;
+            // 🎯 volatile 写入 userId 作为 Populate Fence (非 0 标志着槽位数据可用)
+            this.userId = uid;
+        }
+
+        public void clear() {
+            this.waiterThread = null;
+            this.status = 0;
+            // 🎯 volatile 写入 userId = 0L 作为 Clear Fence (0 标志着槽位已被消费清空)
+            this.userId = 0L;
         }
     }
 
@@ -98,8 +104,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
 
         int index = (int) (currentAvailableReqSeq & mask);
         SyncWaitSlot slot = array[index];
-        // 🎯 填充数据并发布 sequence 屏障
-        slot.reset(currentAvailableReqSeq, uid, thread);
+        slot.reset(uid, thread);
         return slot;
     }
 
@@ -115,7 +120,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     }
 
     /**
-     * SPSC 单消费者 (Netty EventLoop) 查看队头等待槽位 (带 Sequence 校验，防止读取生产者半填充槽位)
+     * SPSC 单消费者 (Netty EventLoop) 查看队头等待槽位 (若生产者仍在写入则纳秒级自旋等待)
      */
     public SyncWaitSlot peek() {
         long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
@@ -123,9 +128,9 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
             return null;
         }
         SyncWaitSlot slot = array[(int) (currentNeededAckSeq & mask)];
-        // 🛡️ 发布屏障校验：如果 Producer CAS 占位成功但未完成 slot.reset(...)，视为暂不可用
-        if (slot.sequence != currentNeededAckSeq) {
-            return null;
+        // 🎯 校验槽位数据：若生产者 CAS 占位成功但未完成 reset(...)，纳秒级自旋等待 userId != 0L
+        while (slot.userId == 0L) {
+            Thread.onSpinWait();
         }
         return slot;
     }
@@ -140,9 +145,9 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         }
         int index = (int) (currentNeededAckSeq & mask);
         SyncWaitSlot slot = array[index];
-        // 🛡️ 发布屏障校验
-        if (slot.sequence != currentNeededAckSeq) {
-            return null;
+        // 🎯 校验槽位数据：若生产者 CAS 占位成功但未完成 reset(...)，纳秒级自旋等待 userId != 0L
+        while (slot.userId == 0L) {
+            Thread.onSpinWait();
         }
         NEXT_NEEDED_ACK_SEQUENCE_HANDLE.setRelease(this, currentNeededAckSeq + 1);
         return slot;

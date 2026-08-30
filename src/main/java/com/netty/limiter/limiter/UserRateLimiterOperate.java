@@ -255,6 +255,7 @@ public class UserRateLimiterOperate {
         java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(50));
 
         int result = slot.status;
+        slot.clear(); // 🎯 消费/超时处理完毕后清空槽位，将 userId 重置为 0L 供后续轮询复用
         if (result == 0) {
             return false; // 🛡️ Fail-Open 超时降级拦截
         }
