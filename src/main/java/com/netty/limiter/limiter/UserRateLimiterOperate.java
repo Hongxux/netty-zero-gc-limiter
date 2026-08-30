@@ -146,15 +146,15 @@ public class UserRateLimiterOperate {
                                     int allowedFlag = (statusByte == '1') ? 1 : 0;
 
                                     SyncWaitSlotRingBuffer.SyncWaitSlot expectedSlot = syncWaitSlotRingBuffer.peek();
-                                    if (expectedSlot != null && expectedSlot.userId == uidFromRedis) {
+                                    if (expectedSlot != null && expectedSlot.getUserIdAcquire() == uidFromRedis) {
                                         // 🎯 返回的 UID 与队头等待槽位的 UID 精确匹配！
                                         syncWaitSlotRingBuffer.poll();
-                                        expectedSlot.status = (allowedFlag == 1) ? 1 : 2;
+                                        expectedSlot.setStatusRelease((allowedFlag == 1) ? 1 : 2);
                                         if (expectedSlot.waiterThread != null) {
                                             java.util.concurrent.locks.LockSupport.unpark(expectedSlot.waiterThread);
                                         }
                                     }
-                                    // 🛡️ 若 expectedSlot.userId != uidFromRedis (即属于模式 A 异步发送返回的数值)，直接跳过不唤醒！
+                                    // 🛡️ 若 expectedSlot.getUserIdAcquire() != uidFromRedis (即属于模式 A 异步发送返回的数值)，直接跳过不唤醒！
                                 }
 
                                 @Override
@@ -254,7 +254,7 @@ public class UserRateLimiterOperate {
         // ③ 同步阻塞等待 Netty ChannelRead 唤醒 (50ms 超时)
         java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(50));
 
-        int result = slot.status;
+        int result = slot.getStatusAcquire();
         slot.clear(); // 🎯 消费/超时处理完毕后清空槽位，将 userId 重置为 0L 供后续轮询复用
         if (result == 0) {
             return false; // 🛡️ Fail-Open 超时降级拦截
