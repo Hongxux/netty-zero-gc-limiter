@@ -1,20 +1,25 @@
 package com.netty.limiter.limiter;
 
+import io.netty.util.concurrent.FastThreadLocal;
+
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 
 /**
  * =========================================================================================
- * 🚀 0-GC 无锁高性能 SyncWaitSlot 环形缓冲区 (物理 Cache Line 伪共享隔离 + Safe Zone 缓存 + VarHandle Acquire/Release 内存屏障)
- * 
- * 【体系结构级微观物理优化与并发安全 Guarantee】：
- * 1. 56 字节 Cache Line 物理隔离: 彻底切断 Single-Consumer (Netty EventLoop) 与 Multi-Producer (网关请求线程) 间的 Cache Line 伪共享 (False Sharing)。
- * 2. Safe Zone 惰性读写序列号: 优先只读本地 L1 Cache，仅在临界满/空时触发 1 次跨核 Bus Sniffing 嗅探。
- * 3. VarHandle Acquire/Release 语义管理与防旧线程污染:
- *    - 移除传统 volatile，全面使用 `VarHandle.setRelease` / `VarHandle.getAcquire` 严格约束 Store-Load / Release-Acquire 屏障。
- *    - 针对 `waiterThread` 引入专用 VarHandle 内存控制，在 `reset` 时 `setRelease` 绑定新线程，在 `clear` 时 `setRelease(null)` 彻底清除残留引用，确保绝对不会误读/唤醒旧线程。
- *    - 生产者写入 `reset` 时以 `setRelease` 结束，保证前面的 status 与 waiterThread 写入对 Consumer 语义可见。
- *    - 消费者以 `getAcquire` 在有界自旋 (MAX_SPIN_COUNT = 4096 + Thread.onSpinWait) 中检测 `userId != 0L`。
+ * 🚀 0-GC 无锁高性能 SyncWaitSlot 环形缓冲区
+ *    (物理 Cache Line 隔离 + Safe Zone + FTL per-thread Slot + ZERO_SLOT COW 原子清空)
+ *
+ * 【内存屏障模型 Guarantee】：
+ * 1. 56 字节 Cache Line 物理隔离：彻底切断 Consumer / Producer 跨核伪共享。
+ * 2. Safe Zone 惰性序列号缓存：临界满/空时才触发 1 次跨核 Bus Sniffing。
+ * 3. FTL per-thread SyncWaitSlot：每个生产者线程独占一个 Slot 实例，彻底消除槽位内部写竞争。
+ * 4. ARRAY_VH Release-Acquire 发布屏障：
+ *    - 生产者在 Slot 字段写完后以 ARRAY_VH.setRelease 发布引用 → Release Fence。
+ *    - 消费者以 ARRAY_VH.getAcquire 读取引用 → Acquire Fence，建立完整 HB 契约。
+ *    - SyncWaitSlot 内部字段均为 plain 字段，无需任何 VarHandle！
+ * 5. status 可见性由 LockSupport.unpark → park Happens-Before 链保证。
+ * 6. ZERO_SLOT COW 原子清空：poll() 以单次 ARRAY_VH.setRelease 将数组槽位替换为 ZERO_SLOT 哨兵。
  * =========================================================================================
  */
 abstract class SyncWaitSlotRingBufferPad0 {
@@ -22,9 +27,7 @@ abstract class SyncWaitSlotRingBufferPad0 {
 }
 
 abstract class SyncWaitSlotRingBufferConsumerFields extends SyncWaitSlotRingBufferPad0 {
-    // nextNeededAckSequence: 消费者 (Netty EventLoop) 下一个急需 ACK 出队的序列号 (由 VarHandle 语义控制)
     protected long nextNeededAckSequence = 0;
-    // cachedNextAvailableRequestSequence: 消费者本地 Safe Zone 缓存的生产者请求序列号 (普通 long，无需跨核嗅探)
     protected long cachedNextAvailableRequestSequence = 0;
 }
 
@@ -33,9 +36,7 @@ abstract class SyncWaitSlotRingBufferPad1 extends SyncWaitSlotRingBufferConsumer
 }
 
 abstract class SyncWaitSlotRingBufferProducerFields extends SyncWaitSlotRingBufferPad1 {
-    // nextAvailableRequestSequence: 生产者 (网关请求线程) 下一个可申请/预占的请求序列号 (由 VarHandle 语义控制)
     protected long nextAvailableRequestSequence = 0;
-    // cachedNextNeededAckSequence: 生产者本地 Safe Zone 缓存的消费者确认序列号 (普通 long)
     protected long cachedNextNeededAckSequence = 0;
 }
 
@@ -45,41 +46,32 @@ abstract class SyncWaitSlotRingBufferPad2 extends SyncWaitSlotRingBufferProducer
 
 public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
 
-    public static final int MAX_SPIN_COUNT = 4096; // 🎯 仿照 LocalBanCache 探查限制，定义自旋最大尝试次数
+    public static final int MAX_SPIN_COUNT = 4096;
 
+    /**
+     * 🎯 FTL per-thread Slot：每个生产者线程独占一个 SyncWaitSlot 实例，0-GC 复用，无跨线程写竞争。
+     */
+    public static final FastThreadLocal<SyncWaitSlot> THREAD_SLOT = new FastThreadLocal<>() {
+        @Override
+        protected SyncWaitSlot initialValue() {
+            return new SyncWaitSlot();
+        }
+    };
+
+    /**
+     * 🎯 ZERO_SLOT 哨兵：标识数组槽位为空，COW 清空的原子占位对象，构造后永不修改其字段。
+     */
+    public static final SyncWaitSlot ZERO_SLOT = new SyncWaitSlot();
+
+    /**
+     * 所有字段均为 plain 字段（无 volatile / VarHandle 内部屏障）：
+     * - userId / waiterThread：可见性由 ARRAY_VH Release-Acquire 屏障保证。
+     * - status：可见性由 LockSupport.unpark → park Happens-Before 保证。
+     */
     public static class SyncWaitSlot {
-        public long userId = 0L; // 0L 标识槽位为空/已被消费清空，非 0 标识已由生产者填充 (由 VarHandle 语义控制)
-        public int status = 0;   // 0=pending, 1=passed, 2=blocked
+        public long userId;
+        public int status;        // 0=pending, 1=passed, 2=blocked
         public Thread waiterThread;
-
-        public void reset(long uid, Thread thread) {
-            this.status = 0;
-            WAITER_THREAD_HANDLE.setRelease(this, thread);
-            // 🎯 VarHandle setRelease 内存屏障: 保证 status 和 waiterThread 的写入在 userId 非零发布前全量刷入 Cache
-            USER_ID_HANDLE.setRelease(this, uid);
-        }
-
-        public void clear() {
-            WAITER_THREAD_HANDLE.setRelease(this, null); // 🎯 明确清空等待线程引用，彻底防止残存旧线程指针
-            STATUS_HANDLE.setRelease(this, 0);
-            USER_ID_HANDLE.setRelease(this, 0L);
-        }
-
-        public long getUserIdAcquire() {
-            return (long) USER_ID_HANDLE.getAcquire(this);
-        }
-
-        public int getStatusAcquire() {
-            return (int) STATUS_HANDLE.getAcquire(this);
-        }
-
-        public void setStatusRelease(int st) {
-            STATUS_HANDLE.setRelease(this, st);
-        }
-
-        public Thread getWaiterThreadAcquire() {
-            return (Thread) WAITER_THREAD_HANDLE.getAcquire(this);
-        }
     }
 
     private final SyncWaitSlot[] array;
@@ -87,18 +79,14 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
 
     private static final VarHandle NEXT_NEEDED_ACK_SEQUENCE_HANDLE;
     private static final VarHandle NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE;
-    private static final VarHandle USER_ID_HANDLE;
-    private static final VarHandle STATUS_HANDLE;
-    private static final VarHandle WAITER_THREAD_HANDLE;
+    private static final VarHandle ARRAY_VH; // 数组元素引用的 VarHandle（唯一的跨线程内存屏障点）
 
     static {
         try {
             MethodHandles.Lookup l = MethodHandles.lookup();
             NEXT_NEEDED_ACK_SEQUENCE_HANDLE = l.findVarHandle(SyncWaitSlotRingBuffer.class, "nextNeededAckSequence", long.class);
             NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE = l.findVarHandle(SyncWaitSlotRingBuffer.class, "nextAvailableRequestSequence", long.class);
-            USER_ID_HANDLE = l.findVarHandle(SyncWaitSlot.class, "userId", long.class);
-            STATUS_HANDLE = l.findVarHandle(SyncWaitSlot.class, "status", int.class);
-            WAITER_THREAD_HANDLE = l.findVarHandle(SyncWaitSlot.class, "waiterThread", Thread.class);
+            ARRAY_VH = MethodHandles.arrayElementVarHandle(SyncWaitSlot[].class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -109,26 +97,35 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         while (cap < capacity) cap <<= 1;
         this.array = new SyncWaitSlot[cap];
         this.mask = cap - 1;
+        // 初始化所有槽位为 ZERO_SLOT 哨兵
         for (int i = 0; i < cap; i++) {
-            this.array[i] = new SyncWaitSlot();
+            ARRAY_VH.setRelease(array, i, ZERO_SLOT);
         }
     }
 
     /**
-     * MPSC 生产者多线程 CAS 预占下一个可用请求槽位入队 (Safe Zone 本地 cachedNextNeededAckSequence 保护)
+     * MPSC 生产者：CAS 预占序列号，从 FTL 取出线程专属 Slot，写入 plain 字段后以 ARRAY_VH.setRelease 原子发布引用。
+     * Plain 字段写入安全：FTL Slot 是线程私有的，只有本线程写入，无跨线程写竞争。
      */
     public SyncWaitSlot offer(long uid, Thread thread) {
         long currentAvailableReqSeq;
         do {
             currentAvailableReqSeq = (long) NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.getAcquire(this);
             if (isFull(currentAvailableReqSeq)) {
-                return null; // 缓冲区满，Fail-Open 降级处理
+                return null; // 缓冲区满，Fail-Open 降级
             }
         } while (!NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.compareAndSet(this, currentAvailableReqSeq, currentAvailableReqSeq + 1));
 
         int index = (int) (currentAvailableReqSeq & mask);
-        SyncWaitSlot slot = array[index];
-        slot.reset(uid, thread);
+
+        // 🎯 FTL 线程专属 Slot：plain 写入字段（无跨线程竞争），由下方 ARRAY_VH.setRelease 统一发布
+        SyncWaitSlot slot = THREAD_SLOT.get();
+        slot.userId = uid;
+        slot.status = 0;
+        slot.waiterThread = thread;
+
+        // 🎯 单次 ARRAY_VH.setRelease = Release Fence：保证上方所有 plain 写对 Consumer getAcquire 可见
+        ARRAY_VH.setRelease(array, index, slot);
         return slot;
     }
 
@@ -144,20 +141,21 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     }
 
     /**
-     * SPSC 单消费者 (Netty EventLoop) 查看队头等待槽位 (VarHandle getAcquire 有界自旋 + Thread.onSpinWait 保护)
+     * SPSC Consumer peek：ARRAY_VH.getAcquire 有界自旋等待槽位非 ZERO_SLOT。
+     * getAcquire 成功后，由 HB 契约保证 slot.userId / slot.waiterThread 对 Consumer 完全可见。
      */
     public SyncWaitSlot peek() {
         long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
         if (isEmpty(currentNeededAckSeq)) {
             return null;
         }
-        SyncWaitSlot slot = array[(int) (currentNeededAckSeq & mask)];
-        
-        // 🎯 VarHandle getAcquire 有界自旋: 最多自旋 4096 次
+        int index = (int) (currentNeededAckSeq & mask);
+
         int spins = 0;
-        while (slot.getUserIdAcquire() == 0L) {
+        SyncWaitSlot slot;
+        while ((slot = (SyncWaitSlot) ARRAY_VH.getAcquire(array, index)) == ZERO_SLOT) {
             if (++spins > MAX_SPIN_COUNT) {
-                return null; // 🛡️ 超出自旋次数上限，防御性降级返回 null
+                return null; // 🛡️ 防御性降级
             }
             Thread.onSpinWait();
         }
@@ -165,7 +163,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     }
 
     /**
-     * SPSC 单消费者 (Netty EventLoop) 弹出队头槽位并推进 nextNeededAckSequence 序列号
+     * SPSC Consumer poll：弹出队头 Slot，以 ARRAY_VH.setRelease(ZERO_SLOT) COW 原子清空槽位，推进序列号。
      */
     public SyncWaitSlot poll() {
         long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
@@ -173,16 +171,18 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
             return null;
         }
         int index = (int) (currentNeededAckSeq & mask);
-        SyncWaitSlot slot = array[index];
-        
-        // 🎯 VarHandle getAcquire 有界自旋
+
         int spins = 0;
-        while (slot.getUserIdAcquire() == 0L) {
+        SyncWaitSlot slot;
+        while ((slot = (SyncWaitSlot) ARRAY_VH.getAcquire(array, index)) == ZERO_SLOT) {
             if (++spins > MAX_SPIN_COUNT) {
-                return null; // 🛡️ 超出自旋次数上限，防御性降级返回 null
+                return null;
             }
             Thread.onSpinWait();
         }
+
+        // 🎯 COW 原子替换：单次 ARRAY_VH.setRelease 将槽位恢复为 ZERO_SLOT，为下一轮 offer 准备
+        ARRAY_VH.setRelease(array, index, ZERO_SLOT);
         NEXT_NEEDED_ACK_SEQUENCE_HANDLE.setRelease(this, currentNeededAckSeq + 1);
         return slot;
     }

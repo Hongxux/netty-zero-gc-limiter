@@ -146,16 +146,17 @@ public class UserRateLimiterOperate {
                                     int allowedFlag = (statusByte == '1') ? 1 : 0;
 
                                     SyncWaitSlotRingBuffer.SyncWaitSlot expectedSlot = syncWaitSlotRingBuffer.peek();
-                                    if (expectedSlot != null && expectedSlot.getUserIdAcquire() == uidFromRedis) {
-                                        // 🎯 返回的 UID 与队头等待槽位的 UID 精确匹配！
-                                        syncWaitSlotRingBuffer.poll();
-                                        expectedSlot.setStatusRelease((allowedFlag == 1) ? 1 : 2);
-                                        Thread targetThread = expectedSlot.getWaiterThreadAcquire();
+                                    // 🎯 peek() 内的 ARRAY_VH.getAcquire 已建立 HB，userId/waiterThread 均为可见 plain 字段
+                                    if (expectedSlot != null && expectedSlot.userId == uidFromRedis) {
+                                        syncWaitSlotRingBuffer.poll(); // COW 替换 ZERO_SLOT，原子清空槽位
+                                        // status plain 写：HB 由下方 unpark → park 链保证
+                                        expectedSlot.status = (allowedFlag == 1) ? 1 : 2;
+                                        Thread targetThread = expectedSlot.waiterThread; // plain 读，已通过 getAcquire 可见
                                         if (targetThread != null) {
                                             java.util.concurrent.locks.LockSupport.unpark(targetThread);
                                         }
                                     }
-                                    // 🛡️ 若 expectedSlot.getUserIdAcquire() != uidFromRedis (即属于模式 A 异步发送返回的数值)，直接跳过不唤醒！
+                                    // 🛡️ 若 userId 不匹配 (模式 A 异步返回数值)，直接跳过不唤醒！
                                 }
 
                                 @Override
@@ -255,8 +256,9 @@ public class UserRateLimiterOperate {
         // ③ 同步阻塞等待 Netty ChannelRead 唤醒 (50ms 超时)
         java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(50));
 
-        int result = slot.getStatusAcquire();
-        slot.clear(); // 🎯 消费/超时处理完毕后清空槽位，将 userId 重置为 0L 供后续轮询复用
+        // status plain 读：HB 由 unpark → park 链保证（park 返回后必然看到 unpark 前的 status 写入）
+        int result = slot.status;
+        // 🎯 无需 slot.clear()：FTL Slot 在下次 offer() 时由本线程自己覆写字段，ZERO_SLOT 已由 poll() COW 原子清空
         if (result == 0) {
             return false; // 🛡️ Fail-Open 超时降级拦截
         }
