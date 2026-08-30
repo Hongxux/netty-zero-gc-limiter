@@ -10,9 +10,10 @@ import java.lang.invoke.VarHandle;
  * 【体系结构级微观物理优化与并发安全 Guarantee】：
  * 1. 56 字节 Cache Line 物理隔离: 彻底切断 Single-Consumer (Netty EventLoop) 与 Multi-Producer (网关请求线程) 间的 Cache Line 伪共享 (False Sharing)。
  * 2. Safe Zone 惰性读写序列号: 优先只读本地 L1 Cache，仅在临界满/空时触发 1 次跨核 Bus Sniffing 嗅探。
- * 3. Clear-on-Consume 0-GC 清空与自旋同步:
+ * 3. Clear-on-Consume 0-GC 清空与有界自旋 (Bounded Spin-Wait) 同步:
  *    - 生产者 CAS 占位后写入 `userId != 0`，最后 volatile 触发填充通知。
- *    - 消费者出队检测到 `userId == 0` 时利用 `Thread.onSpinWait()` 进行极短纳秒级自旋，直至数据就绪。
+ *    - 消费者出队检测到 `userId == 0` 时模仿 LocalBanCache 的有界自旋模式 (MAX_SPIN_COUNT = 4096)，
+ *      结合 `Thread.onSpinWait()` CPU 硬件级 Pause 探测指令进行纳秒级自旋，超时自动防御性降级。
  *    - 消费/超时处理完毕后调用 `slot.clear()` 将 `userId` 置为 0L，为环形缓冲区下一换代循环提供完美复用。
  * =========================================================================================
  */
@@ -43,6 +44,8 @@ abstract class SyncWaitSlotRingBufferPad2 extends SyncWaitSlotRingBufferProducer
 }
 
 public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
+
+    public static final int MAX_SPIN_COUNT = 4096; // 🎯 仿照 LocalBanCache 探查限制，定义自旋最大尝试次数
 
     public static class SyncWaitSlot {
         public volatile long userId = 0L; // 0L 标识槽位为空/已被消费清空，非 0 标识已由生产者填充
@@ -120,7 +123,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     }
 
     /**
-     * SPSC 单消费者 (Netty EventLoop) 查看队头等待槽位 (若生产者仍在写入则纳秒级自旋等待)
+     * SPSC 单消费者 (Netty EventLoop) 查看队头等待槽位 (模仿 LocalBanCache 有界自旋 + Thread.onSpinWait 保护)
      */
     public SyncWaitSlot peek() {
         long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
@@ -128,8 +131,13 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
             return null;
         }
         SyncWaitSlot slot = array[(int) (currentNeededAckSeq & mask)];
-        // 🎯 校验槽位数据：若生产者 CAS 占位成功但未完成 reset(...)，纳秒级自旋等待 userId != 0L
+        
+        // 🎯 模仿 LocalBanCache 极速有界自旋: 最多自旋 4096 次，避免生产者线程异常挂起导致 EventLoop 死锁
+        int spins = 0;
         while (slot.userId == 0L) {
+            if (++spins > MAX_SPIN_COUNT) {
+                return null; // 🛡️ 超出自旋次数上限，防御性降级返回 null
+            }
             Thread.onSpinWait();
         }
         return slot;
@@ -145,8 +153,13 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         }
         int index = (int) (currentNeededAckSeq & mask);
         SyncWaitSlot slot = array[index];
-        // 🎯 校验槽位数据：若生产者 CAS 占位成功但未完成 reset(...)，纳秒级自旋等待 userId != 0L
+        
+        // 🎯 模仿 LocalBanCache 极速有界自旋
+        int spins = 0;
         while (slot.userId == 0L) {
+            if (++spins > MAX_SPIN_COUNT) {
+                return null; // 🛡️ 超出自旋次数上限，防御性降级返回 null
+            }
             Thread.onSpinWait();
         }
         NEXT_NEEDED_ACK_SEQUENCE_HANDLE.setRelease(this, currentNeededAckSeq + 1);
