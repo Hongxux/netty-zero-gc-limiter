@@ -239,27 +239,33 @@ public class UserRateLimiterOperate {
             return false;
         }
 
-        SyncWaitSlotRingBuffer.SyncWaitSlot slot = syncWaitSlotRingBuffer.offer(userId, Thread.currentThread());
-        if (slot == null) {
-            return false; // 🛡️ 缓冲区满，Fail-Open 降级拦截
-        }
+        Thread currentThread = Thread.currentThread();
+        SyncWaitSlotRingBuffer.SyncWaitSlot slot = SyncWaitSlotRingBuffer.THREAD_SLOT.get();
+        slot.userId = userId;
+        slot.waiterThread = currentThread;
+        slot.status = 0;
 
-        // ② 0-GC 拼接 RESP2 EVALSHA 字节流并发送至 Redis TCP Channel
-        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(256);
-        try {
-            encodeResp2EvalSha(buf, luaShaBytes, userId,
-                    System.currentTimeMillis(), maxTokens(), refillRate(), ttlSeconds(), 1);
-            redisChannel.writeAndFlush(buf);
-        } catch (Exception e) {
-            buf.release();
-            log.error("Error sending 0-GC sync EVALSHA command for userId: {}", userId, e);
-            return false; // 🛡️ Fail-Open 降级拦截
-        }
+        // 🎯 核心并发安全修正 (100% 绝对 FIFO 保障)：
+        // 将 offer() 槽位排队与 RESP2 TCP 字节流发送统一提交至 Netty Channel 的 EventLoop 中顺序执行！
+        // 彻底杜绝多生产者线程下 offer() 序列号分配与 TCP writeAndFlush() 顺序倒置/交叉的并发隐患。
+        // 确保：EventLoop 任务队列顺序 == RingBuffer 序列号顺序 == TCP Socket 发送顺序 == Redis RESP2 响应顺序！
+        redisChannel.eventLoop().execute(() -> {
+            boolean offered = syncWaitSlotRingBuffer.offer(slot);
+            if (offered) {
+                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(256);
+                try {
+                    encodeResp2EvalSha(buf, luaShaBytes, userId,
+                            System.currentTimeMillis(), maxTokens(), refillRate(), ttlSeconds(), 1);
+                    redisChannel.writeAndFlush(buf);
+                } catch (Exception e) {
+                    buf.release();
+                    log.error("Error encoding/sending 0-GC sync EVALSHA command for userId: {}", userId, e);
+                }
+            }
+        });
 
         // ③ 同步阻塞等待 Netty ChannelRead 唤醒 (50ms 超时 + 虚假唤醒防护)
         // 🛡️ 虚假唤醒防护：用 deadline while 循环包裹 parkNanos 是 Java 并发标准惯用法。
-        //    场景：上一次请求超时后 EventLoop 迟到唤醒并存入 permit，下一次 park 会被该 stale permit
-        //    立即唤醒导致 status=0 误判。while 循环在第一次迭代消耗 stale permit 后会再次 park，彻底解决虚假唤醒。
         long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(50);
         while (slot.status == 0) {
             long remaining = deadlineNs - System.nanoTime();

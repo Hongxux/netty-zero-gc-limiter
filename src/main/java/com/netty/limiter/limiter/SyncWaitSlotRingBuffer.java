@@ -14,13 +14,11 @@ import java.lang.invoke.VarHandle;
  * 1. 56 字节 Cache Line 物理隔离：彻底切断 Consumer (Netty EventLoop) 与 Producer (网关线程) 跨核伪共享。
  * 2. Safe Zone 惰性序列号缓存：临界满/空时才触发 1 次跨核 Bus Sniffing。
  * 3. FTL per-thread SyncWaitSlot：每个生产者线程独占一个 Slot 实例，0-GC 堆分配。
- * 4. CANCELLED_SLOT 哨兵原子脱钩 (COW Atomic Cancel)：
- *    - 当网关线程 50ms 超时未收到 Redis 响应时，调用 cancel(slot) 通过 CAS (`ARRAY_VH.compareAndSet`)
- *      将 array[index] 中的 slot 原子替换为 `CANCELLED_SLOT` 哨兵。
- *    - 彻底解除 RingBuffer 与 FTL Slot 的指针绑定，杜绝后续请求重用 FTL Slot 时产生对象别名 (Aliasing Bug) 误唤醒！
- * 5. ARRAY_VH Release-Acquire 内存屏障：
- *    - 生产者 offer 时写入 plain 字段，通过 `ARRAY_VH.setRelease` 原子发布引用。
- *    - 消费者 peek/poll 时通过 `ARRAY_VH.getAcquire` 建立 Happens-Before 契约。
+ * 4. 100% 严格 FIFO 顺序保障 (EventLoop 单线程顺序入队)：
+ *    - `offer()` 在 EventLoop 线程中与 `writeAndFlush()` 顺序执行。
+ *    - 确保：EventLoop 任务队列顺序 == RingBuffer 序列号顺序 == Netty TCP Write 顺序 == Redis 响应顺序 (100% 绝对一致，零并发倒置隐患)。
+ * 5. CANCELLED_SLOT 哨兵原子脱钩 (COW Atomic Cancel)：
+ *    - 50ms 超时未收到 Redis 响应时，通过 CAS (`ARRAY_VH.compareAndSet`) 将 array[index] 原子替换为 `CANCELLED_SLOT` 哨兵，彻底解决对象别名 (Aliasing Bug)。
  * =========================================================================================
  */
 abstract class SyncWaitSlotRingBufferPad0 {
@@ -106,28 +104,22 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     }
 
     /**
-     * MPSC 生产者：CAS 预占序列号，从 FTL 取出线程专属 Slot，写入 plain 字段并记录 index，最后以 ARRAY_VH.setRelease 原子发布引用。
+     * SPSC 生产者 (由 Redis Channel EventLoop 顺序提交执行)：
+     * 预占序列号，写入 index 并通过 ARRAY_VH.setRelease 原子发布引用。
+     * 由于在 EventLoop 线程中顺序执行，保证与 writeAndFlush 发送 TCP 字节流顺序 100% 绝对一致，零并发倒置隐患！
      */
-    public SyncWaitSlot offer(long uid, Thread thread) {
-        long currentAvailableReqSeq;
-        do {
-            currentAvailableReqSeq = (long) NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.getAcquire(this);
-            if (isFull(currentAvailableReqSeq)) {
-                return null; // 缓冲区满，Fail-Open 降级
-            }
-        } while (!NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.compareAndSet(this, currentAvailableReqSeq, currentAvailableReqSeq + 1));
-
+    public boolean offer(SyncWaitSlot slot) {
+        long currentAvailableReqSeq = (long) NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.getAcquire(this);
+        if (isFull(currentAvailableReqSeq)) {
+            return false; // 缓冲区满，Fail-Open 降级
+        }
         int index = (int) (currentAvailableReqSeq & mask);
-
-        SyncWaitSlot slot = THREAD_SLOT.get();
-        slot.userId = uid;
-        slot.status = 0;
-        slot.waiterThread = thread;
         slot.index = index;
+        slot.status = 0;
 
-        // 🎯 单次 ARRAY_VH.setRelease = Release Fence：保证上方所有 plain 写对 Consumer getAcquire 可见
         ARRAY_VH.setRelease(array, index, slot);
-        return slot;
+        NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.setRelease(this, currentAvailableReqSeq + 1);
+        return true;
     }
 
     /**
