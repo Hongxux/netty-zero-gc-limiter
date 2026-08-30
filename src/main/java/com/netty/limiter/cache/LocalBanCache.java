@@ -34,6 +34,15 @@ public class LocalBanCache {
 
     public static final long EMPTY = 0L;
     public static final long TOMBSTONE = -1L;
+    public static final long WARNED_EXP_SEC_MARK = (-2L) & 0xFFFFFFFFL; // 0xFFFFFFFEL, 对应 ExpSec = -2L
+
+    public static final int BAN_STATUS_PASSED = 0;
+    public static final int BAN_STATUS_HARD_BANNED = 1;
+    public static final int BAN_STATUS_WARNED_SYNC_REQUIRED = 2;
+
+    public static boolean isLiveEntry(long entry) {
+        return entry != EMPTY && entry != TOMBSTONE;
+    }
 
     public static long pack(long userId, long expireTimeSec) {
         return ((userId & 0xFFFFFFFFL) << 32) | (expireTimeSec & 0xFFFFFFFFL);
@@ -116,10 +125,13 @@ public class LocalBanCache {
     }
 
     /**
-     * 🚀 单指令 64-bit 解包极速查询: 判断 UID 是否被封禁 (支持 Cold -> Hot 自动晋升)
+     * 🚀 极速获取 UID 封禁状态:
+     * 0 -> 未封禁 (BAN_STATUS_PASSED, 可走 0-GC 异步非阻塞上报)
+     * 1 -> 硬封禁 (BAN_STATUS_HARD_BANNED, 直接拒绝 403)
+     * 2 -> 80% 水位降级预警 (BAN_STATUS_WARNED_SYNC_REQUIRED, ExpSec == -2L，必须走同步上报等待 Redis Ack)
      */
-    public boolean isUserBanned(long userId) {
-        if (userId <= 0) return false;
+    public int getUserBanStatus(long userId) {
+        if (userId <= 0) return BAN_STATUS_PASSED;
 
         int baseIndex = (int) (mixHash(userId) & MASK);
         long nowSec = System.currentTimeMillis() / 1000;
@@ -133,18 +145,20 @@ public class LocalBanCache {
             long entry = h.getEntryAcquire(index);
 
             if (entry == EMPTY) {
-                break; // 遇到 EMPTY 停止热表探查
+                break;
             }
             if (entry != TOMBSTONE) {
                 long storedUid = unpackUid(entry);
                 if (storedUid == userId) {
                     long expireTimeSec = unpackExpSec(entry);
+                    if (expireTimeSec == WARNED_EXP_SEC_MARK) {
+                        return BAN_STATUS_WARNED_SYNC_REQUIRED;
+                    }
                     if (expireTimeSec > nowSec) {
-                        return true;
+                        return BAN_STATUS_HARD_BANNED;
                     } else {
-                        // 已过期: CAS 标记为 TOMBSTONE
                         h.casEntry(index, entry, TOMBSTONE);
-                        return false;
+                        return BAN_STATUS_PASSED;
                     }
                 }
             }
@@ -163,31 +177,43 @@ public class LocalBanCache {
                 long storedUid = unpackUid(entry);
                 if (storedUid == userId) {
                     long expireTimeSec = unpackExpSec(entry);
+                    if (expireTimeSec == WARNED_EXP_SEC_MARK) {
+                        return BAN_STATUS_WARNED_SYNC_REQUIRED;
+                    }
                     if (expireTimeSec > nowSec) {
-                        // 冷表中有效: 执行【冷到热晋升 Promotion】
                         if (c.casEntry(index, entry, TOMBSTONE)) {
-                            putUserBan(userId, expireTimeSec - nowSec);
+                            putUserBanWithExactExpSec(userId, expireTimeSec);
                         }
-                        return true;
+                        return BAN_STATUS_HARD_BANNED;
                     } else {
                         c.casEntry(index, entry, TOMBSTONE);
-                        return false;
+                        return BAN_STATUS_PASSED;
                     }
                 }
             }
         }
 
-        return false;
+        return BAN_STATUS_PASSED;
     }
 
     /**
-     * 🚀 单条 64-bit CAS 抢占写入: 封禁 UID (自动打入 Hot Table + 满阈值自动双表轮转)
+     * 🚀 单指令 64-bit 解包极速查询: 判断 UID 是否被硬封禁
      */
-    public void putUserBan(long userId, long durationSeconds) {
-        if (userId <= 0) return;
+    public boolean isUserBanned(long userId) {
+        return getUserBanStatus(userId) == BAN_STATUS_HARD_BANNED;
+    }
 
-        long nowSec = System.currentTimeMillis() / 1000;
-        long expireTimeSec = nowSec + durationSeconds;
+    /**
+     * 🚀 80% 水位线预警标记: 将 ExpSec 设为特殊标记 WARNED_EXP_SEC_MARK (-2L)
+     * 处于该状态的 UID 后续请求将触发【同步上报 Redis 校验】
+     */
+    public void putUserWarned(long userId) {
+        if (userId <= 0) return;
+        putUserBanWithExactExpSec(userId, WARNED_EXP_SEC_MARK);
+    }
+
+    public void putUserBanWithExactExpSec(long userId, long expireTimeSec) {
+        if (userId <= 0) return;
         long packed = pack(userId, expireTimeSec);
 
         TableHolder h = getTablesAcquire().hot;
@@ -203,31 +229,65 @@ public class LocalBanCache {
             int index = (baseIndex + i) & MASK;
             long entry = h.getEntryAcquire(index);
 
-            if (entry != EMPTY && entry != TOMBSTONE) {
-                long storedUid = unpackUid(entry);
-                // ① 已存在: 更新 packed 单元
-                if (storedUid == userId) {
-                    h.setEntryRelease(index, packed);
+            if (isLiveEntry(entry)) {
+                // ① 已有节点: 检查是否相同 UID，匹配则覆写更新
+                if (tryUpdateExistingEntryIfSameUid(h, index, entry, userId, packed)) {
                     return;
                 }
             } else {
-                // ② 空槽位或墓碑: 单条 CMPXCHG 原子抢占写入 (UID + Exp 瞬间一步到位!)
-                if (h.casEntry(index, entry, packed)) {
-                    h.count.incrementAndGet();
+                // ② 快路径插入: 尝试单条 CAS 抢占空槽位/墓碑
+                if (tryInsert(h, index, entry, packed)) {
                     return;
                 }
-                // 再次确认
-                if (reconfirmAndSetEntry(h, index, userId, packed)) {
+                // ③ CAS 争用确认: 若抢占失败，确认是否由并发线程抢先写入了相同 UID
+                if (ifTheSameUidTryUpdate(h, index, userId, packed)) {
                     return;
                 }
             }
         }
 
-        // 兜底策略
-        int idx = baseIndex & MASK;
-        if (!h.casEntry(idx, h.getEntryAcquire(idx), packed)) {
-            h.setEntryRelease(idx, packed);
+        // 🛡️ 兜底策略: 16 次探查全满或争用失败后退回 baseIndex 强制写入，确保黑名单 100% 落地
+        fallbackForceSetEntry(h, baseIndex, packed);
+    }
+
+    /**
+     * 🚀 兜底强行 Volatile 写入 (Fail-Secure Fallback Insertion):
+     * 当探查 MAX_PROBE (16) 次全满/争用失败时，退回首个哈希槽 baseIndex 强行 Release 写入 packed，保证黑名单 100% 落地
+     */
+    private static void fallbackForceSetEntry(TableHolder h, int baseIndex, long packed) {
+        h.setEntryRelease(baseIndex & MASK, packed);
+    }
+
+    /**
+     * 🚀 已有节点覆写判定: 校验槽位 entry 是否匹配相同 UID；匹配则使用 CAS 覆写更新 ExpSec 时间戳
+     */
+    private static boolean tryUpdateExistingEntryIfSameUid(TableHolder h, int index, long entry, long userId, long packed) {
+        long storedUid = unpackUid(entry);
+        if (storedUid == userId) {
+            return h.casEntry(index, entry, packed);
         }
+        return false;
+    }
+
+
+    /**
+     * 🚀 尝试单条 CAS 抢占空槽位/墓碑写入新节点 (若成功则增加 count 节点计数)
+     */
+    private static boolean tryInsert(TableHolder h, int index, long expectedEntry, long packed) {
+        if (h.casEntry(index, expectedEntry, packed)) {
+            h.count.incrementAndGet();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 🚀 单条 64-bit CAS 抢占写入: 封禁 UID (自动打入 Hot Table + 满阈值自动双表轮转)
+     */
+    public void putUserBan(long userId, long durationSeconds) {
+        if (userId <= 0) return;
+        long nowSec = System.currentTimeMillis() / 1000;
+        putUserBanWithExactExpSec(userId, nowSec + durationSeconds);
     }
 
     /**
@@ -262,11 +322,21 @@ public class LocalBanCache {
         }
     }
 
-    private static boolean reconfirmAndSetEntry(TableHolder h, int index, long userId, long packed) {
+    /**
+     * 🚀 并发 CAS 争用二次确认 (Same-UID Slot Contention Check):
+     *
+     * 【在确认什么？】
+     * 确认当快路径 CAS 抢占空槽位/墓碑失败时，导致失败的原因【是否是因为另一个并发线程抢先写入了相同的 UID】。
+     *
+     * 1. 场景：线程 A 发现槽位 i 为 EMPTY，准备 CAS 写入 UID=10086；但微秒间隙内线程 B 抢先 CAS 写入成功。
+     * 2. 确认：线程 A 在 CAS 失败后，二次读取该槽位 entry，若确认 `unpackUid(entry) == userId`（说明线程 B 写的也是 10086）；
+     * 3. 动作：说明槽位已被该 UID 成功占领，无需重复增加 `count` 节点计数，使用 CAS 原子更新 ExpSec 时间戳并返回 true！
+     * 4. 否决：若二次确认发现是其他不同的 UID 抢占，则返回 false，外层循环继续探查 (Probe) 下一个槽位。
+     */
+    private static boolean ifTheSameUidTryUpdate(TableHolder h, int index, long userId, long packed) {
         long entry = h.getEntryAcquire(index);
-        if (entry != EMPTY && entry != TOMBSTONE && unpackUid(entry) == userId) {
-            h.setEntryRelease(index, packed);
-            return true;
+        if (isLiveEntry(entry) && unpackUid(entry) == userId) {
+            return h.casEntry(index, entry, packed);
         }
         return false;
     }

@@ -165,11 +165,15 @@ public class RedisUserBanSubscriber implements CommandLineRunner {
             return;
         }
 
-        // 3. 判断是否包含前缀 "U:" 或 "u:"
+        // 3. 判断是否包含前缀 "U:" / "W:" (U: 封禁, W: 80% 水位预警)
         int curStart = start;
+        boolean isWarning = false;
         if (len >= 2 && msg.getByte(start + 1) == ':') {
             byte prefix = (byte) Character.toUpperCase((char) firstByte);
-            if (prefix == 'U') {
+            if (prefix == 'W') {
+                isWarning = true;
+                curStart = start + 2;
+            } else if (prefix == 'U') {
                 curStart = start + 2;
             }
         }
@@ -187,8 +191,15 @@ public class RedisUserBanSubscriber implements CommandLineRunner {
         }
 
         if (userId > 0) {
-            localBanCache.putUserBan(userId, duration);
-            log.warn("Received 0-GC RESP2 PubSub UID ban message for userId: {}, duration: {}s", userId, duration);
+            if (isWarning) {
+                // W: 80% 水位预警 -> 写入 -2L 特殊降级标记 (WARNED_EXP_SEC_MARK)，后续请求触发同步上报 Redis 校验
+                localBanCache.putUserWarned(userId);
+                log.warn("Received 0-GC RESP2 PubSub 80% Watermark Warning for userId: {}, set ExpSec=-2L (Sync Required)", userId);
+            } else {
+                // U: 100% 彻底耗尽 -> 写入硬封禁
+                localBanCache.putUserBan(userId, duration);
+                log.warn("Received 0-GC RESP2 PubSub UID Hard Ban message for userId: {}, duration: {}s", userId, duration);
+            }
         }
     }
 

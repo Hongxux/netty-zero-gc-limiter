@@ -81,10 +81,25 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
                 }
             }
 
-            // 防线 3: Per-UID 0-GC RESP2 异步上报 (Async Offloading + Pipeline 攒批)
+            // 防线 3: Per-UID 限流上报与降级校验 (双版本：普通 0-GC 异步 offload vs 80% 预警 -2L 同步等待 Ack)
             Long userId = ctx.channel().attr(SecurityAttributeKeys.USER_ID).get();
-            if (userId != null && userId > 0) {
-                userRateLimiterOperate.acquire0GcUidBatch(userId, com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
+            if (userId != null && userId > 0 && userRateLimiterOperate != null) {
+                int userBanStatus = localBanCache.getUserBanStatus(userId);
+                if (userBanStatus == LocalBanCache.BAN_STATUS_HARD_BANNED) {
+                    rejectAndRelease(ctx, downstreamBuf, 403, SecurityResponses.RESPONSE_403, RateLimitReasonCodes.REASON_LOCAL_BAN);
+                    return;
+                } else if (userBanStatus == LocalBanCache.BAN_STATUS_WARNED_SYNC_REQUIRED) {
+                    // 🚨 80% 水位降级预警 (ExpSec == -2L)：执行【同步上报版本】，必须等待 Redis 返回 Ack (1 放行 / 0 拒绝)
+                    boolean granted = userRateLimiterOperate.acquire0GcUidSync(userId, com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
+                    if (!granted) {
+                        localBanCache.putUserBan(userId, 60); // 升级为硬封禁
+                        rejectAndRelease(ctx, downstreamBuf, 403, SecurityResponses.RESPONSE_403, RateLimitReasonCodes.REASON_LOCAL_BAN);
+                        return;
+                    }
+                } else {
+                    // 🚀 普通未预警 UID：执行【异步非阻塞上报版本】(Async Offloading + Pipeline 攒批)
+                    userRateLimiterOperate.acquire0GcUidBatch(userId, com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
+                }
             }
 
             // 安全校验全部通过，重置 readerIndex 为 0 并透传给下游 Pipeline

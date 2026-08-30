@@ -2,6 +2,7 @@ package com.netty.limiter.limiter;
 
 import com.netty.limiter.cache.LocalBanCache;
 import com.netty.limiter.config.GatewayRateLimitProperties;
+import com.netty.limiter.util.ZeroGcNumberUtil;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
@@ -24,6 +25,8 @@ import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -127,11 +130,31 @@ public class UserRateLimiterOperate {
                         protected void initChannel(SocketChannel ch) {
                             // 1. 30秒未写数据自动触发心跳保活检测，防止 TCP 半开假死 (Half-Open Connection)
                             ch.pipeline().addLast(new IdleStateHandler(0, 30, 0, TimeUnit.SECONDS));
+                            // 2. 0-GC 粘包/半包帧聚合拆包器 (LineBasedFrameDecoder 按 \r\n 拆分完备 RESP2 响应)
+                            ch.pipeline().addLast(new io.netty.handler.codec.LineBasedFrameDecoder(1024));
                             ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
                                 @Override
                                 protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
-                                    // 🚀 Fire-and-Forget 0-CPU 解码：跳过 RESP2 响应
-                                    msg.skipBytes(msg.readableBytes());
+                                    int start = msg.readerIndex();
+                                    int end = msg.writerIndex();
+                                    int colonIdx = msg.indexOf(start, end, (byte) ':');
+                                    if (colonIdx < 0 || colonIdx >= end - 1) {
+                                        return;
+                                    }
+                                    long uidFromRedis = ZeroGcNumberUtil.parseLongFromByteBuf(msg, start, colonIdx);
+                                    byte statusByte = msg.getByte(colonIdx + 1);
+                                    int allowedFlag = (statusByte == '1') ? 1 : 0;
+
+                                    SyncWaitSlotRingBuffer.SyncWaitSlot expectedSlot = syncWaitSlotRingBuffer.peek();
+                                    if (expectedSlot != null && expectedSlot.userId == uidFromRedis) {
+                                        // 🎯 返回的 UID 与队头等待槽位的 UID 精确匹配！
+                                        syncWaitSlotRingBuffer.poll();
+                                        expectedSlot.status = (allowedFlag == 1) ? 1 : 2;
+                                        if (expectedSlot.waiterThread != null) {
+                                            java.util.concurrent.locks.LockSupport.unpark(expectedSlot.waiterThread);
+                                        }
+                                    }
+                                    // 🛡️ 若 expectedSlot.userId != uidFromRedis (即属于模式 A 异步发送返回的数值)，直接跳过不唤醒！
                                 }
 
                                 @Override
@@ -194,6 +217,48 @@ public class UserRateLimiterOperate {
                 eventLoopGroup.schedule(this::connectToRedisAsync, delaySeconds, TimeUnit.SECONDS);
             }
         }
+    }
+
+    // =========================================================================================
+    // 🚀 0-GC 同步校验基础设施: 无 GC 数组预分配 RingBuffer (0 堆内存分配、0 Node 开销)
+    // =========================================================================================
+    private final SyncWaitSlotRingBuffer syncWaitSlotRingBuffer = new SyncWaitSlotRingBuffer(1024);
+
+    /**
+     * 🚀 模式 B (0-GC 同步上报放行校验): 针对 80% 水位预警 (-2L) UID 执行 RESP2 0-GC 同步 EVALSHA 扣减
+     * 100% 零 GC 堆内存分配，无 Node 垃圾回收负担。
+     */
+    public boolean acquire0GcUidSync(long userId, byte[] luaShaBytes) {
+        if (redisChannel == null || !redisChannel.isActive()) {
+            // 🛡️ Fail-Closed / Connection Dead 降级保护
+            return false;
+        }
+
+        SyncWaitSlotRingBuffer.SyncWaitSlot slot = syncWaitSlotRingBuffer.offer(userId, Thread.currentThread());
+        if (slot == null) {
+            return false; // 🛡️ 缓冲区满，Fail-Open 降级拦截
+        }
+
+        // ② 0-GC 拼接 RESP2 EVALSHA 字节流并发送至 Redis TCP Channel
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(256);
+        try {
+            encodeResp2EvalSha(buf, luaShaBytes, userId,
+                    System.currentTimeMillis(), maxTokens(), refillRate(), ttlSeconds(), 1);
+            redisChannel.writeAndFlush(buf);
+        } catch (Exception e) {
+            buf.release();
+            log.error("Error sending 0-GC sync EVALSHA command for userId: {}", userId, e);
+            return false; // 🛡️ Fail-Open 降级拦截
+        }
+
+        // ③ 同步阻塞等待 Netty ChannelRead 唤醒 (50ms 超时)
+        java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(50));
+
+        int result = slot.status;
+        if (result == 0) {
+            return false; // 🛡️ Fail-Open 超时降级拦截
+        }
+        return result == 1;
     }
 
     /**

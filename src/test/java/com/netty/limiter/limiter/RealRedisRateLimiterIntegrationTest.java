@@ -44,10 +44,10 @@ class RealRedisRateLimiterIntegrationTest {
 
             List<String> key = List.of("rate:test:10086");
             List<String> args = List.of("1700000000000", "2", "2", "2", "1");
-            Long first = commands.evalsha(sha, ScriptOutputType.INTEGER, key.toArray(new String[0]), args.toArray(new String[0]));
-            Long second = commands.evalsha(sha, ScriptOutputType.INTEGER, key.toArray(new String[0]), args.toArray(new String[0]));
-            assertEquals(1L, first);
-            assertEquals(1L, second);
+            String first = commands.evalsha(sha, ScriptOutputType.VALUE, key.toArray(new String[0]), args.toArray(new String[0]));
+            String second = commands.evalsha(sha, ScriptOutputType.VALUE, key.toArray(new String[0]), args.toArray(new String[0]));
+            assertEquals("10086:1", first);
+            assertEquals("10086:1", second);
 
             CountDownLatch banEvent = new CountDownLatch(1);
             pubSub = client.connectPubSub();
@@ -62,13 +62,13 @@ class RealRedisRateLimiterIntegrationTest {
             pubSub.sync().subscribe(CHANNEL);
             Thread.sleep(100);
 
-            Long rejected = commands.evalsha(sha, ScriptOutputType.INTEGER, key.toArray(new String[0]), args.toArray(new String[0]));
-            assertEquals(0L, rejected);
+            String rejected = commands.evalsha(sha, ScriptOutputType.VALUE, key.toArray(new String[0]), args.toArray(new String[0]));
+            assertEquals("10086:0", rejected);
             assertTrue(banEvent.await(2, TimeUnit.SECONDS));
 
             List<String> refillArgs = List.of("1700000001500", "2", "2", "2", "1");
-            Long refilled = commands.evalsha(sha, ScriptOutputType.INTEGER, key.toArray(new String[0]), refillArgs.toArray(new String[0]));
-            assertEquals(1L, refilled);
+            String refilled = commands.evalsha(sha, ScriptOutputType.VALUE, key.toArray(new String[0]), refillArgs.toArray(new String[0]));
+            assertEquals("10086:1", refilled);
         } finally {
             if (pubSub != null) {
                 pubSub.close();

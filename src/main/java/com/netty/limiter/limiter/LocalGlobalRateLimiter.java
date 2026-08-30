@@ -191,13 +191,17 @@ public class LocalGlobalRateLimiter {
         private static final int MIN_BATCH_FETCH_STEP = 4;
         private static final int INITIAL_BATCH_FETCH_STEP = 16;
         private static final int MAX_BATCH_FETCH_STEP = 512;
-        private static final long TARGET_CAS_INTERVAL_MILLIS = 50L;
+
+        /** 动态划转目标采样间隔上下限 (ms) */
+        private static final long MIN_FETCH_INTERVAL_MILLIS = 15L;
+        private static final long MAX_FETCH_INTERVAL_MILLIS = 200L;
 
         private final GlobalTokenBucket globalTokenBucket;
         private int threadLocalRemainingTokens = 0;
         private int currentAdaptiveFetchStep = INITIAL_BATCH_FETCH_STEP;
-        private long cooldownUntilMillis = 0L;
+        private long exhaustionCircuitBreakUntilMillis = 0L;
         private long lastFetchTimestampMillis = System.currentTimeMillis();
+        private long leaseExpireTimestampMillis = 0L;
         private int lastBatchGrantedTokens = 0;
 
         public ThreadTokenBuffer(GlobalTokenBucket globalTokenBucket) {
@@ -206,17 +210,16 @@ public class LocalGlobalRateLimiter {
         }
 
         /**
-         * 尝试获取 1 个令牌 (优先消耗线程私有缓冲区，本地耗尽时触发速率自适应动态划转)
+         * 尝试获取 1 个令牌 (优先消耗线程私有缓冲区有效租约，若租约过期则自动清零重新划转)
          */
         public boolean tryAcquire() {
-            if (threadLocalRemainingTokens > 0) {
-                threadLocalRemainingTokens--;
+            long currentTimeMillis = System.currentTimeMillis();
+
+            if (tryConsumeValidLeaseToken(currentTimeMillis)) {
                 return true;
             }
 
-            long currentTimeMillis = System.currentTimeMillis();
-
-            if (currentTimeMillis < cooldownUntilMillis) {
+            if (isQuotaExhaustionCircuitBroken(currentTimeMillis)) {
                 return false;
             }
 
@@ -226,14 +229,45 @@ public class LocalGlobalRateLimiter {
 
             if (actualGrantedTokens > 0) {
                 threadLocalRemainingTokens = actualGrantedTokens - 1;
-                // 低水位主动降维：若实际划转量小于申请步长，同步收缩当前步长，防止下一次继续用大 Step 暴击全局桶引发 CAS 争用风暴
+                // 低水位主动降维：若实际划转量小于申请步长，同步收缩当前步长，防止下一次继续用大 Step 暴击全局桶引发争用风暴
                 syncAdaptiveFetchStepToSupply(actualGrantedTokens);
                 recordSuccessfulFetchSample(currentTimeMillis, actualGrantedTokens);
                 return true;
             } else {
-                handleContentionBackoff(currentTimeMillis);
+                // 全局配额极度不足/划转失败，触发自适应配额枯竭短路熔断
+                handleQuotaExhaustionCircuitBreak(currentTimeMillis);
                 return false;
             }
+        }
+
+        /**
+         * 校验当前线程是否正处于全局配额枯竭的短路熔断状态 (Circuit Broken State)
+         */
+        private boolean isQuotaExhaustionCircuitBroken(long currentTimeMillis) {
+            return currentTimeMillis < exhaustionCircuitBreakUntilMillis;
+        }
+
+        /**
+         * 校验并尝试扣减有效的线程私有租约令牌 (如果租约已过期，自动清空失效旧令牌)
+         */
+        private boolean tryConsumeValidLeaseToken(long currentTimeMillis) {
+            if (threadLocalRemainingTokens <= 0) {
+                return false;
+            }
+            if (isLeaseExpired(currentTimeMillis)) {
+                invalidateExpiredLeaseTokens();
+                return false;
+            }
+            threadLocalRemainingTokens--;
+            return true;
+        }
+
+        private boolean isLeaseExpired(long currentTimeMillis) {
+            return currentTimeMillis >= leaseExpireTimestampMillis;
+        }
+
+        private void invalidateExpiredLeaseTokens() {
+            this.threadLocalRemainingTokens = 0;
         }
 
         /**
@@ -246,42 +280,53 @@ public class LocalGlobalRateLimiter {
         }
 
         /**
-         * 记录一次成功划转的净采样点 (Net Sampling Point)
+         * 记录一次成功划转的净采样点并计算租约到期时间
          */
         private void recordSuccessfulFetchSample(long currentTimeMillis, int actualGrantedTokens) {
             this.lastFetchTimestampMillis = currentTimeMillis;
             this.lastBatchGrantedTokens = actualGrantedTokens;
+            updateLeaseExpiration(currentTimeMillis, actualGrantedTokens);
         }
 
         /**
-         * 处理争用避退：平滑折半收缩步长、清除已被避退污染的采样点并触发短路冷静避退
+         * 根据划转令牌数量与当前 QPS 填充速率，计算并更新物理租约到期时间戳 (Lease Expiration Settlement)
+         * 公式：leaseDurationMillis = (actualGrantedTokens * 1000ms) / tokensPerSec
          */
-        private void handleContentionBackoff(long currentTimeMillis) {
-            decayFetchStepOnContention();
-            clearContentionPollutedSamplingPoint();
-            triggerContentionCooldown(currentTimeMillis);
+        private void updateLeaseExpiration(long currentTimeMillis, int actualGrantedTokens) {
+            int tokensPerSec = globalTokenBucket.getConfigSnapshot().tokensPerSec();
+            long leaseDurationMillis = Math.max(1L, ((long) actualGrantedTokens * 1000L) / (long) tokensPerSec);
+            this.leaseExpireTimestampMillis = currentTimeMillis + leaseDurationMillis;
         }
 
         /**
-         * 争用/枯竭时平滑折半收缩划转步长 (如 256->128->64)
+         * 处理配额枯竭短路熔断：平滑折半收缩步长、清除污染采样点并触发带 Jitter 随机错峰的短路冷静避退
          */
-        private void decayFetchStepOnContention() {
+        private void handleQuotaExhaustionCircuitBreak(long currentTimeMillis) {
+            decayFetchStepOnExhaustion();
+            clearExhaustionPollutedSamplingPoint();
+            triggerExhaustionCircuitCooldown(currentTimeMillis);
+        }
+
+        /**
+         * 配额枯竭/划转失败时平滑折半收缩划转步长 (如 256->128->64)
+         */
+        private void decayFetchStepOnExhaustion() {
             currentAdaptiveFetchStep = Math.max(MIN_BATCH_FETCH_STEP, currentAdaptiveFetchStep >> 1);
         }
 
         /**
-         * 争用避退时清除已被避退耗时污染的采样点，彻底防止后续错误地根据被污染的旧采样点计算消耗速率
+         * 划转失败时清除已被避退耗时污染的采样点，彻底防止后续错误地根据被污染的旧采样点计算消耗速率
          */
-        private void clearContentionPollutedSamplingPoint() {
+        private void clearExhaustionPollutedSamplingPoint() {
             this.lastFetchTimestampMillis = 0L;
             this.lastBatchGrantedTokens = 0;
         }
 
         /**
-         * 依据收缩后的步长，触发自适应冷静避退
+         * 依据收缩后的步长，触发自适应配额枯竭短路熔断冷静期
          */
-        private void triggerContentionCooldown(long currentTimeMillis) {
-            cooldownUntilMillis = currentTimeMillis + calculateBackoffCooldownMillis(currentAdaptiveFetchStep);
+        private void triggerExhaustionCircuitCooldown(long currentTimeMillis) {
+            exhaustionCircuitBreakUntilMillis = currentTimeMillis + getExhaustionCooldownByFetchStep(currentAdaptiveFetchStep);
         }
 
         /**
@@ -301,23 +346,36 @@ public class LocalGlobalRateLimiter {
         }
 
         /**
-         * 根据当前净采样点，计算基于消耗速率的自适应划转步长 (EMA 平滑)
+         * 根据当前净采样点与基于全局 QPS 速率算出的划转目标间隔，计算基于消耗速率的划转步长 (EMA 平滑)
          */
         private void computeRateBasedFetchStep(long currentTimeMillis) {
-            // 保证耗时至少为 1ms，防止同 1 毫秒内极其高频暴击造成零除
             long elapsedMillis = Math.max(1L, currentTimeMillis - lastFetchTimestampMillis);
+            long targetFetchInterval = calculateRateBasedBaseFetchInterval();
+
+            // 注意：使用 (lastBatchGrantedTokens * targetFetchInterval) / elapsedMillis 避免整数除法截断为 0
             int targetFetchStep = (int) Math.min(
                     MAX_BATCH_FETCH_STEP,
-                    Math.max(MIN_BATCH_FETCH_STEP, (lastBatchGrantedTokens * TARGET_CAS_INTERVAL_MILLIS) / elapsedMillis)
+                    Math.max(MIN_BATCH_FETCH_STEP, (lastBatchGrantedTokens * targetFetchInterval) / elapsedMillis)
             );
             // 采用 EMA 指数平滑更新步长：(当前步长 + 目标步长) / 2
             currentAdaptiveFetchStep = (currentAdaptiveFetchStep + targetFetchStep) >> 1;
         }
 
         /**
-         * 根据当前收缩后的划转步长，计算争用避退冷静期窗口 (毫秒)
+         * 基于全局 QPS 填充速率动态计算最佳基础划转采样间隔 (ms)
          */
-        private long calculateBackoffCooldownMillis(int fetchStep) {
+        private long calculateRateBasedBaseFetchInterval() {
+            int tokensPerSec = globalTokenBucket.getConfigSnapshot().tokensPerSec();
+            if (tokensPerSec >= 200_000) return 15L; // 超高 QPS：15ms，避开 512 步长截断
+            if (tokensPerSec >= 50_000)  return 30L; // 高 QPS：30ms
+            if (tokensPerSec >= 10_000)  return 50L; // 标准 QPS：50ms
+            return 100L;                             // 低 QPS：100ms，精细化管控
+        }
+
+        /**
+         * 根据当前划转步长 (fetchStep) 梯度的收缩程度，决议配额枯竭短路熔断冷静期窗口 (ms)
+         */
+        private long getExhaustionCooldownByFetchStep(int fetchStep) {
             if (fetchStep <= 2) return 5L;
             if (fetchStep <= 8) return 3L;
             if (fetchStep <= 32) return 2L;
