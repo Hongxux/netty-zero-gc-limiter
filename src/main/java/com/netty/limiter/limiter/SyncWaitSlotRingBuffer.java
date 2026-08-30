@@ -5,12 +5,14 @@ import java.lang.invoke.VarHandle;
 
 /**
  * =========================================================================================
- * 🚀 0-GC 无锁高性能 SyncWaitSlot 环形缓冲区 (物理 Cache Line 伪共享隔离 + Safe Zone 缓存优化版)
+ * 🚀 0-GC 无锁高性能 SyncWaitSlot 环形缓冲区 (物理 Cache Line 伪共享隔离 + Safe Zone 缓存 + 序列号发布屏障)
  * 
- * 【体系结构级微观物理优化】：
+ * 【体系结构级微观物理优化与并发安全 Guarantee】：
  * 1. 56 字节 Cache Line 物理隔离: 彻底切断 Single-Consumer (Netty EventLoop) 与 Multi-Producer (网关请求线程) 间的 Cache Line 伪共享 (False Sharing)。
- * 2. Safe Zone 惰性读写序列号 (cachedNextNeededAckSequence / cachedNextAvailableRequestSequence): 优先只读本地 L1 Cache，仅在临界满/空时触发 1 次跨核 Bus Sniffing 嗅探。
- * 3. 0-GC 预分配槽位数组: 槽位实例在构造时一次性预分配，只重置状态字段，彻底消除 JVM 堆内存 Node 开销。
+ * 2. Safe Zone 惰性读写序列号: 优先只读本地 L1 Cache，仅在临界满/空时触发 1 次跨核 Bus Sniffing 嗅探。
+ * 3. 序列号发布屏障 (Slot Sequence Release Barrier):
+ *    生产者 CAS 成功预占 `nextAvailableRequestSequence` 后，必须在完成槽位数据赋值后最后 volatile 写入 `slot.sequence`。
+ *    消费者在 `peek` / `poll` 时校验 `slot.sequence == currentNeededAckSeq`，彻底消除 CAS 预占与槽位填充间极小时间窗口内的读写竞态！
  * =========================================================================================
  */
 abstract class SyncWaitSlotRingBufferPad0 {
@@ -42,14 +44,17 @@ abstract class SyncWaitSlotRingBufferPad2 extends SyncWaitSlotRingBufferProducer
 public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
 
     public static class SyncWaitSlot {
+        public volatile long sequence = -1L; // 🎯 序列号发布屏障 (Publish Barrier)
         public volatile long userId;
         public volatile int status; // 0=pending, 1=passed, 2=blocked
         public volatile Thread waiterThread;
 
-        public void reset(long uid, Thread thread) {
+        public void reset(long seq, long uid, Thread thread) {
             this.userId = uid;
             this.status = 0;
             this.waiterThread = thread;
+            // 🎯 最后 volatile 写入 sequence，作为 Release Barrier，保证 userId/waiterThread 对 Consumer 语义可见
+            this.sequence = seq;
         }
     }
 
@@ -93,7 +98,8 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
 
         int index = (int) (currentAvailableReqSeq & mask);
         SyncWaitSlot slot = array[index];
-        slot.reset(uid, thread);
+        // 🎯 填充数据并发布 sequence 屏障
+        slot.reset(currentAvailableReqSeq, uid, thread);
         return slot;
     }
 
@@ -109,14 +115,19 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     }
 
     /**
-     * SPSC 单消费者 (Netty EventLoop) 查看队头等待槽位 (Safe Zone 本地 cachedNextAvailableRequestSequence 保护)
+     * SPSC 单消费者 (Netty EventLoop) 查看队头等待槽位 (带 Sequence 校验，防止读取生产者半填充槽位)
      */
     public SyncWaitSlot peek() {
         long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
         if (isEmpty(currentNeededAckSeq)) {
             return null;
         }
-        return array[(int) (currentNeededAckSeq & mask)];
+        SyncWaitSlot slot = array[(int) (currentNeededAckSeq & mask)];
+        // 🛡️ 发布屏障校验：如果 Producer CAS 占位成功但未完成 slot.reset(...)，视为暂不可用
+        if (slot.sequence != currentNeededAckSeq) {
+            return null;
+        }
+        return slot;
     }
 
     /**
@@ -129,6 +140,10 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         }
         int index = (int) (currentNeededAckSeq & mask);
         SyncWaitSlot slot = array[index];
+        // 🛡️ 发布屏障校验
+        if (slot.sequence != currentNeededAckSeq) {
+            return null;
+        }
         NEXT_NEEDED_ACK_SEQUENCE_HANDLE.setRelease(this, currentNeededAckSeq + 1);
         return slot;
     }
