@@ -104,21 +104,24 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     }
 
     /**
-     * SPSC 生产者 (由 Redis Channel EventLoop 顺序提交执行)：
-     * 预占序列号，写入 index 并通过 ARRAY_VH.setRelease 原子发布引用。
-     * 由于在 EventLoop 线程中顺序执行，保证与 writeAndFlush 发送 TCP 字节流顺序 100% 绝对一致，零并发倒置隐患！
+     * MPSC/SPSC 生产者：CAS 原子抢占可用序列号，写入 index 并通过 ARRAY_VH.setRelease 原子发布引用。
+     * 线程安全：使用 CAS 循环抢占 nextAvailableRequestSequence，彻底杜绝序列号覆盖与并发冲突隐患。
      */
     public boolean offer(SyncWaitSlot slot) {
-        long currentAvailableReqSeq = (long) NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.getAcquire(this);
-        if (isFull(currentAvailableReqSeq)) {
-            return false; // 缓冲区满，Fail-Open 降级
-        }
+        long currentAvailableReqSeq;
+        do {
+            currentAvailableReqSeq = (long) NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.getAcquire(this);
+            if (isFull(currentAvailableReqSeq)) {
+                return false; // 缓冲区满，Fail-Open 降级
+            }
+        } while (!NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.compareAndSet(this, currentAvailableReqSeq, currentAvailableReqSeq + 1));
+
         int index = (int) (currentAvailableReqSeq & mask);
         slot.index = index;
         slot.status = 0;
 
+        // 🎯 单次 ARRAY_VH.setRelease = Release Fence：保证上方 plain 写入对 Consumer getAcquire 可见
         ARRAY_VH.setRelease(array, index, slot);
-        NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.setRelease(this, currentAvailableReqSeq + 1);
         return true;
     }
 
