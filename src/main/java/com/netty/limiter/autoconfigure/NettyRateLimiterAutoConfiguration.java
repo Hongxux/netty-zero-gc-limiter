@@ -1,7 +1,7 @@
 package com.netty.limiter.autoconfigure;
 
 import com.netty.limiter.cache.LocalBanCache;
-import com.netty.limiter.cache.RedisIpBanSubscriber;
+import com.netty.limiter.cache.RedisUserBanSubscriber;
 import com.netty.limiter.config.GatewayRateLimitConfigListener;
 import com.netty.limiter.config.GatewayRateLimitProperties;
 import com.netty.limiter.handler.JwtHeaderSecurityHandler;
@@ -45,8 +45,8 @@ public class NettyRateLimiterAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public RedisIpBanSubscriber redisIpBanSubscriber() {
-        return new RedisIpBanSubscriber();
+    public RedisUserBanSubscriber redisUserBanSubscriber() {
+        return new RedisUserBanSubscriber();
     }
 
     @Bean

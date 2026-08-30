@@ -23,11 +23,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * @description: Redis Pub/Sub 全网黑名单 0-GC RESP2 原生 Socket 订阅器 (彻底抹平 Spring Data Reactive 依赖)
+ * @description: Redis Pub/Sub 全网 UID 黑名单 0-GC RESP2 原生 Socket 订阅器
+ * 专为 UID 全网黑名单同步设计，绝对 0 堆内存分配
  **/
 @Slf4j
 @Component
-public class RedisIpBanSubscriber implements CommandLineRunner {
+public class RedisUserBanSubscriber implements CommandLineRunner {
 
     private static final String BAN_PUBSUB_CHANNEL = "NETTY_LIMITER_BAN_CHANNEL";
     private static final byte[] SUBSCRIBE_CMD_BYTES = ("*2\r\n$9\r\nSUBSCRIBE\r\n$" 
@@ -118,14 +119,14 @@ public class RedisIpBanSubscriber implements CommandLineRunner {
                 reconnecting.set(false);
                 if (future.isSuccess()) {
                     subscriberChannel = ((ChannelFuture) future).channel();
-                    log.info("Successfully connected RESP2 PubSub subscriber to Redis [{}:{}] on channel [{}]", host, port, BAN_PUBSUB_CHANNEL);
+                    log.info("Successfully connected RESP2 PubSub UID subscriber to Redis [{}:{}] on channel [{}]", host, port, BAN_PUBSUB_CHANNEL);
                 } else {
-                    log.error("Failed to connect RESP2 PubSub subscriber to Redis [{}:{}]", host, port);
+                    log.error("Failed to connect RESP2 PubSub UID subscriber to Redis [{}:{}]", host, port);
                     scheduleReconnect();
                 }
             });
         } catch (Exception e) {
-            log.error("Error initiating RESP2 PubSub connection", e);
+            log.error("Error initiating RESP2 PubSub UID connection", e);
             scheduleReconnect();
         }
     }
@@ -142,10 +143,10 @@ public class RedisIpBanSubscriber implements CommandLineRunner {
     }
 
     /**
-     * 🚀 100% 0-GC 裸 ByteBuf 解析黑名单通知 (零堆内存分配)
-     * 仅支持 2 种高效格式:
-     * 1. "10001:300" (uid:banTime - 封禁 userId=10001, 时长 300 秒)
-     * 2. "10001"     (uid - 封禁 userId=10001, 默认时长 60 秒)
+     * 🚀 100% 0-GC 裸 ByteBuf 解析 UID 黑名单通知 (零堆内存分配)
+     * 支持格式:
+     * 1. "10001:300" 或 "U:10001:300" (UID 封禁, 时长 300 秒)
+     * 2. "10001" (UID 封禁, 默认时长 60 秒)
      */
     private void processByteBufLine0GC(ByteBuf msg) {
         int start = msg.readerIndex();
@@ -154,33 +155,50 @@ public class RedisIpBanSubscriber implements CommandLineRunner {
         if (len <= 0) return;
 
         byte firstByte = msg.getByte(start);
-        // 1. 过滤 RESP2 协议元数据标头: * (0x2A), $ (0x24)
-        if (firstByte == '*' || firstByte == '$') {
+        // 1. 过滤 RESP2 协议控制标头: * (Array), $ (BulkString), : (Integer), + (SimpleString), - (Error)
+        if (isResp2ProtocolHeader(firstByte)) {
             return;
         }
 
-        // 2. 检查是否匹配 "message" / "subscribe" / BAN_PUBSUB_CHANNEL 频道名
-        // 3. 0-GC 裸字节直接提取 userId 与 banTime
-        int colonIdx = msg.indexOf(start, end, (byte) ':');
+        // 2. 过滤 "message" / "subscribe" / BAN_PUBSUB_CHANNEL 频道名等 RESP2 PubSub 字符串元数据
+        if (isMetadataHeader(msg, start, len)) {
+            return;
+        }
+
+        // 3. 判断是否包含前缀 "U:" 或 "u:"
+        int curStart = start;
+        if (len >= 2 && msg.getByte(start + 1) == ':') {
+            byte prefix = (byte) Character.toUpperCase((char) firstByte);
+            if (prefix == 'U') {
+                curStart = start + 2;
+            }
+        }
+
+        int colonIdx = msg.indexOf(curStart, end, (byte) ':');
         long userId;
         long duration = 60L; // 默认 60 秒
+
         if (colonIdx >= 0) {
-            userId = ZeroGcNumberUtil.parseLongFromByteBuf(msg, start, colonIdx);
+            userId = ZeroGcNumberUtil.parseLongFromByteBuf(msg, curStart, colonIdx);
             long dur = ZeroGcNumberUtil.parseLongFromByteBuf(msg, colonIdx + 1, end);
             if (dur > 0) duration = dur;
         } else {
-            userId = ZeroGcNumberUtil.parseLongFromByteBuf(msg, start, end);
+            userId = ZeroGcNumberUtil.parseLongFromByteBuf(msg, curStart, end);
         }
 
         if (userId > 0) {
             localBanCache.putUserBan(userId, duration);
-            log.warn("Received 0-GC RESP2 PubSub ban message for userId: {}, duration: {}s", userId, duration);
+            log.warn("Received 0-GC RESP2 PubSub UID ban message for userId: {}, duration: {}s", userId, duration);
         }
     }
 
     private static final byte[] MESSAGE_BYTES = "message".getBytes(StandardCharsets.US_ASCII);
     private static final byte[] SUBSCRIBE_BYTES = "subscribe".getBytes(StandardCharsets.US_ASCII);
     private static final byte[] BAN_PUBSUB_CHANNEL_BYTES = BAN_PUBSUB_CHANNEL.getBytes(StandardCharsets.US_ASCII);
+
+    private boolean isResp2ProtocolHeader(byte firstByte) {
+        return firstByte == '*' || firstByte == '$' || firstByte == ':' || firstByte == '+' || firstByte == '-';
+    }
 
     private boolean isMetadataHeader(ByteBuf buf, int start, int len) {
         if (len == 7 && ZeroGcNumberUtil.equalsBytesIgnoreCase(buf, start, MESSAGE_BYTES)) return true;
@@ -199,9 +217,9 @@ public class RedisIpBanSubscriber implements CommandLineRunner {
             if (ownEventLoopGroup != null) {
                 ownEventLoopGroup.shutdownGracefully().syncUninterruptibly();
             }
-            log.info("Successfully stopped RESP2 PubSub subscriber.");
+            log.info("Successfully stopped RESP2 PubSub UID subscriber.");
         } catch (Exception e) {
-            log.error("Error shutting down RESP2 PubSub subscriber", e);
+            log.error("Error shutting down RESP2 PubSub UID subscriber", e);
         }
     }
 }

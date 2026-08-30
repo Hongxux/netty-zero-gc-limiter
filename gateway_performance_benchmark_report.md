@@ -239,31 +239,89 @@ jcmd 48291 GC.class_histogram | grep -E "java.lang.String|LinkedHashMap" | head 
 * **`nextNeededAckSequence` (下一个急需被 ACK 确认出队的序列号)**：单消费者 Redis 回调线程通过 `NEXT_NEEDED_ACK_SEQUENCE_HANDLE.setRelease` 单向推进；
 * **`cachedNextNeededAckSequence` (生产者本地 Safe Zone 缓存下一个急需确认序列号)**：生产者本地的安全区边界缓存，切断 99.99% 的跨 CPU 核心总线嗅探；
 * **`cachedNextAvailableRequestSequence` (消费者本地 Safe Zone 缓存生产者请求序列号)**：消费者本地的安全区保守缓存，**实现出队/消费端 99.99% 跨核读屏障剪枝**；
-* **物理 Cache Line 隔离 (False Sharing Defense)**：在 Consumer 字段与 Producer 字段之间插入 56 字节 (7 个 `long` 变量) 的 Padding 填充块，彻底防止跨 Core 的 CPU 缓存乒乓 (Cache Bounce)。
+* **物理 Cache Line 隔离重构 (Class Inheritance Padding Defense)**：
+  - **ThreadTokenBuffer 精简**：彻底剥离 `FastThreadLocal` 线程独占缓存缓冲区中的冗余 Padding，节省 112 字节/线程内存开销；
+  - **UidRingBuffer 阶梯隔离**：针对易被 HotSpot JVM 字段重排序（Field Reordering）破坏的平铺 Padding，重构为遵从 JVM 规范的**类继承阶梯隔离（Class Inheritance Padding / Disruptor 模式）**：
+    `UidRingBufferPad0 (64B)` → `ConsumerFields` (`nextNeededAckSequence` & `cachedNextAvailableRequestSequence`) → `UidRingBufferPad1 (64B 屏障)` → `ProducerFields` (`nextAvailableRequestSequence` & `cachedNextNeededAckSequence`) → `UidRingBufferPad2 (64B)` → `UidRingBuffer`，确保 HotSpot JVM 绝不会跨类重排序，在无任何 JVM 附加参数的前提下达成 100% 物理 Cache Line 隔离。
 
 ---
 
-### 2. 1,600 万次高并发操作 (MPSC 16 生产者线程) 实测对比
+### 2. 1,600 万次高并发操作 (MPSC 16 生产者线程 -> 1600 万 offer/poll) 最新实测对比 (2026-08-29)
 
 | 优化版本与并发模型 | 1600万次总耗时 | 单机极限吞吐量 (Ops/sec QPS) | 跨 Core 读/屏障开销 | 相对未优化版提升 |
 | :--- | :--- | :--- | :--- | :--- |
-| **未优化基准版** (每次 `offer()` 与 `poll()` 都强制跨核 `getAcquire`) | `3632.73 ms` | **4,404,401 QPS** (440 万) | 极高（高频总线嗅探） | 基准线 (1.0x) |
-| **单向 SafeZone 优化版** (仅生产者带 Safe Zone 缓存) | `1152.08 ms` | **13,887,947 QPS** (1,388 万) | 中等（出队仍受跨核束缚） | +215.32% (3.15x) |
-| **双向 SafeZone 优化版** (双向 Safe Zone 内存剪枝) | `625.20 ms` | **25,591,913 QPS** (2,559 万) | 极其微弱 | +481.05% (5.81x) |
-| **MemorySegment / Unsafe 堆外裸内存单条出队** | `498.51 ms` | **32,095,812 QPS** (3,209 万) | 零 (擦除 JVM 数组越界检查分支) | +628.72% (7.28x) |
-| **Unsafe + 自适应攒批屏障稀释 (`pollBatchAdaptive`)** | **`441.18 ms`** | **36,266,492 QPS** (**3,626 万**) | **零 + 写屏障稀释 N 倍 (双机制静默 Flush)** | **+723.41% (8.23x)** 🚀🚀🚀🚀 |
+| **全内存读未优化版** (每次 `offer()` 与 `poll()` 都强制跨核 `getAcquire`) | `2152.32 ms` | **7,433,853 QPS** (743 万) | 极高（高频总线嗅探） | 基准线 (1.0x) |
+| **Non-Volatile 普通版** (普通读写无缓存剪枝) | `1100.06 ms` | **14,544,705 QPS** (1,454 万) | 中等 | +95.66% (1.95x) |
+| **Volatile SafeZone 优化版** (双向 Safe Zone 内存剪枝) | `485.25 ms` | **32,973,007 QPS** (3,297 万) | 极其微弱 | +343.55% (4.43x) |
+| **Unsafe + 自适应攒批屏障稀释 (`pollBatchAdaptive`)** | `504.72 ms` | **31,700,720 QPS** (3,170 万) | 零 + 写屏障稀释 N 倍 | +326.43% (4.26x) |
+| **Unsafe 堆外裸内存 (类继承阶梯 Padding 物理隔离)** 🚀 | **`432.09 ms`** | **37,029,340 QPS** (**3,702.9 万**) | **零 (擦除 JVM 数组越界检查 + 物理 Cache Line 隔离)** | **+398.12% (4.98x)** 🚀🚀🚀🚀 |
 
 ---
 
 ### 3. 微观体系结构分析与结论
 
-1. **写屏障稀释 (Write Barrier Amortization) + 双重静默 Flush**：
-   消费端引入 `pollBatchAdaptive(dst, minBatch, maxBatch, maxWaitNanos)` 后，将单次 `setRelease` 写屏障开销稀释 N 倍（如 32~256 倍），同时辅以 100µs 超时静默 Flush，不仅消除了高频跨核总线刷新，而且创造了 **3,626 万 QPS** 的单机性能奇迹！
-2. **MemorySegment / Unsafe 堆外擦除边界检查效应**：
-   在标准 Java 数组 `long[]` 访问中，JVM 每次读写均隐式包含 `cmp`（下标越界比较）与 `jae`（跳转抛异常）逻辑。使用 `MemorySegment` / `Unsafe.allocateMemory` 堆外裸内存基址直接偏移寻址（`address + (index << 3)`），将编译后的 x86 汇编精简为纯粹的 `mov [rax + rbx*8], rdx` 内存写入，**擦除了 CPU 分支预测失败的可能**。
-3. **双向 Safe Zone 内存剪枝效应**：
+1. **类继承阶梯隔离（Disruptor 模式）消除了伪共享隐患**：
+   重构后，`Unsafe 堆外裸内存` 测试跑出了 **3,702.9 万 QPS** 的历史最高峰值吞吐（耗时 432.09 ms），相比未优化的 743 万 QPS 提升了近 **5 倍**。类继承防线消除了 JIT 编译器在优化时误将字段重排序的潜在隐患。
+2. **写屏障稀释 (Write Barrier Amortization) + 双重静默 Flush**：
+   消费端引入 `pollBatchAdaptive(dst, minBatch, maxBatch, maxWaitNanos)` 后，将单次 `setRelease` 写屏障开销稀释 N 倍（如 32~256 倍），同时辅以 100µs 超时静默 Flush，不仅消除了高频跨核总线刷新，而且创造了 **3,170 万 QPS** 的极高稳定并发吞吐。
+3. **MemorySegment / Unsafe 堆外擦除边界检查效应**：
+   在标准 Java 数组 `long[]` 访问中，JVM 每次读写均隐式包含 `cmp`（下标越界比较）与 `jae`（跳转抛异常）逻辑。使用 `Unsafe.allocateMemory` 堆外裸内存基址直接偏移寻址（`address + (index << 3)`），将编译后的 x86 汇编精简为纯粹的 `mov [rax + rbx*8], rdx` 内存写入，**擦除了 CPU 分支预测失败的可能**。
+4. **双向 Safe Zone 内存剪枝效应**：
    通过在 `isFull()`（生产者端）与 `isEmpty()`（消费者端）分别引入 `cachedNextNeededAckSequence` 与 `cachedNextAvailableRequestSequence`，队列成功消除了 99.99% 的跨 CPU 核心 `getAcquire` 屏障与总线嗅探（Bus Sniffing）。
-3. **CAS 隐式全屏障广播效应**：
+5. **CAS 隐式全屏障广播效应**：
    在 `offer()` 循环中，`NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.compareAndSet`（底层 x86 汇编 `lock cmpxchg`）具备全内存屏障（Full Memory Barrier）语义。更新 Safe Zone 边界时无须使用 `volatile`，直接普通变量读写即可达成零开销广播。
-3. **极短自旋校验 (`Thread.onSpinWait()`)**：
-   消费端 `poll()` 在发现 `nextNeededAckSequence < nextAvailableRequestSequence` 但槽位仍为 `0L` 时，通过指令级 `PAUSE` 自旋等待，确保数据完全写屏障落盘 (`ARRAY_HANDLE.setRelease`) 后方才出队，彻底消除误读与撕裂数据风险。
+6. **极短自旋校验 (`Thread.onSpinWait()`)**：
+   消费端 `poll()` 在发现 `nextNeededAckSequence < nextAvailableRequestSequence` 但槽位仍为 `0L` 时，通过指令级 `PAUSE` 自旋等待，确保数据完全写屏障落盘后方才出队，彻底消除误读与撕裂数据风险。
+
+---
+
+## 六、 粗粒度 LRU 黑名单与 64-bit 打包/交错内存布局性能压测报告 (JwtSigUidCache & LocalBanCache)
+
+在 JDK 21 环境下，黑名单缓存 `LocalBanCache` 与 JWT 鉴权缓存 `JwtSigUidCache` 经历了三代核心架构升级：
+
+### 1. 核心架构演进路径 (Architectural Evolution)
+
+* **第一代：独立 4 数组架构 (Baseline)**
+  * 分别维护 `keys[]`, `sigPrefixes[]`, `values[]`, `expTimes[]` 4 个独立数组。
+  * 缺陷：访问单个槽位引发 **4 次不连续的物理内存抓取**，内存碎片多，CPU L1/L2 Cache Line 缺失率高。
+
+* **第二代：64-bit 位域压缩打包 (Single Long Bit-Packing)**
+  * 将 32-bit `userId` / `uid`（高 32 位）与 32-bit `expireTimeSec`（低 32 位）压缩打包写入单个 64-bit `long` 中。
+  * 编码：`packed = ((uid & 0xFFFFFFFFL) << 32) | (expSec & 0xFFFFFFFFL)`
+  * 收益：物理内存占用直接**解耦缩减 50%**，通过单条 `CMPXCHG` / `setRelease` 指令在 1 个 CPU 周期内完成 UID 与过期时间的强一致性原子发布。
+
+* **第四代（最新王者）：分层交错内存布局 (Layered Interleaved Layout)** 👑
+  * **keyPrefixes 探查域 (2-Long 交错)**：按 `[2*i -> key]`、`[2*i+1 -> sigPrefix]` 布局。
+  * **valExps 数据域 (独立 64-bit 打包数组)**：按 `[i -> packed(UID, ExpSec)]` 独立布局。
+  * **硬件绝杀优势**：
+    1. **极清净探查**：单条 64-Byte CPU L1 Cache Line 完美容纳 **4 组 `(key, sigPrefix)`**，探查过程零脏读 Value；
+    2. **物理彻底消除并发伪共享 (False Sharing Elimination)**：写线程修改 `valExps` 数据域时，**绝对不会导致读线程正在探查的 `keyPrefixes` 缓存行失效 (Invalidate)**！
+
+---
+
+### 2. Hot Table 负载率阈值 (Load Factor Threshold) 极限压测
+
+针对 `LocalBanCache` 双表轮转中不同 Hot Table 轮转阈值（20% ~ 70%）在 8 线程高频读写混压下的性能表现测试：
+
+| 阈值 Ratio | 阀值槽位数 (Capacity=65536) | 8 线程并发吞吐 (ops/sec) | **8 线程并发延迟 (ns/op)** | 触发轮转次数 | 性能评估与机制分析 |
+|:---:|:---:|:---:|:---:|:---:|---|
+| **20%** | 13,107 | 30.95 M ops/sec | 32.31 ns | 123 次 | 🔴 轮转过于频繁，数组 `clear()` 重置与 CAS 争用开销剧增 |
+| **30%** | 19,660 | 26.47 M ops/sec | 37.77 ns | 90 次 | 🔴 轮转频率偏高，冷热晋升引发争用 |
+| **🏆 40%** | **26,214** | **50.55 M ops/sec** | **19.78 ns** | **70 次** | **👑 黄金甜点区 (平均探查深度 1.2 步与轮转频率的最佳平衡)** |
+| **50%** | 32,768 | 37.59 M ops/sec | 26.61 ns | 53 次 | 🟡 装载率偏高，探查链延长导致 L1 Cache 命中率微降 |
+| **60%** | 39,321 | 31.99 M ops/sec | 31.26 ns | 45 次 | 🔴 开放寻址冲突加剧 |
+| **70%** | 45,875 | 34.62 M ops/sec | 28.89 ns | 39 次 | 🔴 哈希散列到达探查上限，碰撞退化严重 |
+
+---
+
+### 3. `JwtSigUidCache` 各布局方案实测对比 (500万/800万次混压)
+
+| 布局架构方案 | 单线程 Read 延迟 (ns/op) | 16 线程并发吞吐 (M ops/sec) | 16 线程并发延迟 (ns/op) | 硬件评语 |
+| :--- | :--- | :--- | :--- | :--- |
+| **第一代：4 个独立数组 (Baseline)** | 35.00 ns | 39.00 M ops/sec | 25.64 ns | 🔴 跨 4 数组 fetch，L1 Miss 高 |
+| **第三代：3-Long 完全交错 (单 entries 数组)** | 16.05 ns | 130.64 M ops/sec | 7.65 ns | 🟢 单 Cache Line 覆盖 24B |
+| **第四代：分层交错 (`keyPrefixes` 2-Long + 独立 `valExps`)** 🏆 | **14.35 ns** 🚀 | **152.26 M ops/sec** (1.52 亿 QPS) 🚀 | **6.57 ns** 🚀 | **👑 绝对王者：消除 False Sharing，Cache Line 密度极高** |
+
+**结论**：**分层交错布局 (Layered Interleaved)** 达成了历史最高的 **1.5226 亿 QPS** 吞吐，单次操作延迟降低至 **6.57 纳秒**！
+
+

@@ -57,7 +57,7 @@ public class ZeroGcJwtAuthTest {
 
         long uid = ZeroGcJwtParser.INSTANCE.authenticateJwtAndExtractUid(buf, 0, buf.readableBytes());
         System.out.println("Expired JWT Result UID: " + uid);
-        Assertions.assertEquals(0L, uid);
+        Assertions.assertEquals(-2L, uid); // -2L 代表签名有效但已自然过期
 
         buf.release();
     }
@@ -65,7 +65,7 @@ public class ZeroGcJwtAuthTest {
     @Test
     public void testTamperedJwtAuthenticationFails() throws Exception {
         String validJwt = generateValidJwt("{\"alg\":\"HS256\",\"typ\":\"JWT\"}", "{\"uid\":10086}");
-        // 篡改密文中的字符 (模拟黑客黑客篡改 uid 为 88888)
+        // 篡改密文中的字符 (模拟黑客篡改 uid 为 88888)
         String tamperedJwt = validJwt.replace("eyJ1aWQiOjEwMDg2fQ", "eyJ1aWQiOjg4ODg4fQ");
 
         ByteBuf buf = Unpooled.directBuffer();
@@ -73,7 +73,7 @@ public class ZeroGcJwtAuthTest {
 
         long uid = ZeroGcJwtParser.INSTANCE.authenticateJwtAndExtractUid(buf, 0, buf.readableBytes());
         System.out.println("非法篡改 JWT 鉴权失败，返回 UID: " + uid);
-        // 签名不匹配，强行拦截返回 0
+        Assertions.assertEquals(-1L, uid); // -1L 代表签名伪造 / 篡改攻击
         buf.release();
     }
 
@@ -86,7 +86,7 @@ public class ZeroGcJwtAuthTest {
 
         long uid = ZeroGcJwtParser.INSTANCE.authenticateJwtAndExtractUid(buf, 0, buf.readableBytes());
         System.out.println("Missing Exp JWT Result UID: " + uid);
-        Assertions.assertEquals(0L, uid);
+        Assertions.assertEquals(-2L, uid); // -2L 代表无 exp/已过期
 
         buf.release();
     }

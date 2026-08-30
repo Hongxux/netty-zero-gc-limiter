@@ -19,6 +19,8 @@ import java.nio.charset.StandardCharsets;
 
 import com.netty.limiter.util.SecurityResponses;
 
+import com.netty.limiter.listener.RateLimitReasonCodes;
+
 /**
  * @description: Netty 极前置 0-GC 限流与黑名单防线 Handler
  **/
@@ -54,28 +56,29 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
         try {
             // 防线 1: 节点级 0-GC 无锁令牌桶限流
             if (!localGlobalRateLimiter.tryAcquire()) {
-                rejectAndRelease(ctx, downstreamBuf, 429, SecurityResponses.RESPONSE_429, "Global Rate Limit Exceeded");
+                rejectAndRelease(ctx, downstreamBuf, 429, SecurityResponses.RESPONSE_429, RateLimitReasonCodes.REASON_GLOBAL_RATE_LIMIT);
                 return;
             }
 
             // 防线 2: JWT Header 0-GC 极速解析与 UID 黑名单检查 (原生 int 状态码，0 堆内存分配)
             int banStatus = jwtHeaderSecurityHandler.authenticateJwtAndCheckBanStatus(downstreamBuf, ctx, localBanCache);
             if (banStatus != JwtHeaderSecurityHandler.STATUS_PASSED) {
-                boolean isInvalidJwt = (banStatus == JwtHeaderSecurityHandler.STATUS_INVALID_JWT);
-                int statusCode = isInvalidJwt ? 401 : 403;
-                ByteBuf responseBuf = isInvalidJwt ? SecurityResponses.RESPONSE_401 : SecurityResponses.RESPONSE_403;
-
-                if (isInvalidJwt) {
-                    // 如果识别到非法/畸形/已过期的 JWT 攻击，自动将客户端 IP 加入本地黑名单并关闭连接
-                    Long ip4 = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV4_LONG).get();
-                    if (ip4 != null && ip4 != 0) {
-                        String clientIp = com.netty.limiter.util.ZeroGcNumberUtil.formatIpToString(ip4);
-                        localBanCache.putBanInfo(clientIp, "Banned due to Invalid JWT Attack", 300);
-                    }
+                if (banStatus == JwtHeaderSecurityHandler.STATUS_USER_BANNED) {
+                    rejectAndRelease(ctx, downstreamBuf, 403, SecurityResponses.RESPONSE_403, RateLimitReasonCodes.REASON_LOCAL_BAN);
+                    return;
                 }
 
-                rejectAndRelease(ctx, downstreamBuf, statusCode, responseBuf, isInvalidJwt ? "Invalid or Expired JWT Token" : "User is in local ban list");
-                return;
+                if (banStatus == JwtHeaderSecurityHandler.STATUS_EXPIRED_JWT) {
+                    // Token 自然过期：仅返回 401 Unauthorized，引导客户端重新登录
+                    rejectAndRelease(ctx, downstreamBuf, 401, SecurityResponses.RESPONSE_401, RateLimitReasonCodes.REASON_INVALID_JWT);
+                    return;
+                }
+
+                if (banStatus == JwtHeaderSecurityHandler.STATUS_INVALID_JWT) {
+                    // 伪造/篡改/非法签名：直接返回 401 Unauthorized 并关闭连接
+                    rejectAndRelease(ctx, downstreamBuf, 401, SecurityResponses.RESPONSE_401, RateLimitReasonCodes.REASON_INVALID_JWT);
+                    return;
+                }
             }
 
             // 防线 3: Per-UID 0-GC RESP2 异步上报 (Async Offloading + Pipeline 攒批)
@@ -98,18 +101,24 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
         ctx.fireChannelRead(buf);
     }
 
-    private void rejectAndRelease(ChannelHandlerContext ctx, ByteBuf buf, int code, ByteBuf responseBuf, String reason) {
-        notifyListener(ctx, code, reason);
+    private void rejectAndRelease(ChannelHandlerContext ctx, ByteBuf buf, int code, ByteBuf responseBuf, int reasonCode) {
+        notifyListener(ctx, code, reasonCode);
         sendResponseAndClose(ctx, responseBuf.retainedDuplicate());
         buf.release();
     }
 
-    private void notifyListener(ChannelHandlerContext ctx, int code, String reason) {
+    private void notifyListener(ChannelHandlerContext ctx, int code, int reasonCode) {
         if (eventListener != null) {
-            Long ip4 = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV4_LONG).get();
-            String clientIp = ip4 != null && ip4 != 0 ? com.netty.limiter.util.ZeroGcNumberUtil.formatIpToString(ip4) : "";
+            Long ipHighAttr = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV6_HIGH).get();
+            Long ipLowAttr = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV6_LOW).get();
+            long ipHigh = ipHighAttr != null ? ipHighAttr : 0L;
+            long ipLow = ipLowAttr != null ? ipLowAttr : 0L;
+            if (ipHigh == 0L && ipLow == 0L) {
+                Long ip4 = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV4_LONG).get();
+                ipLow = ip4 != null ? ip4 : 0L;
+            }
             Long userId = ctx.channel().attr(SecurityAttributeKeys.USER_ID).get();
-            eventListener.onRateLimitTriggered(clientIp, userId != null ? userId : 0L, code, reason);
+            eventListener.onRateLimitTriggered(ipHigh, ipLow, userId != null ? userId : 0L, code, reasonCode);
         }
     }
 

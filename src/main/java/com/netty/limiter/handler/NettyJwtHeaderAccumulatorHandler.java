@@ -17,6 +17,8 @@ import java.nio.charset.StandardCharsets;
 
 import com.netty.limiter.util.SecurityResponses;
 
+import com.netty.limiter.listener.RateLimitReasonCodes;
+
 /**
  * @description: 0-GC 极速 JWT Header 拆包/半包与前置鉴权 ChannelDuplexHandler
  * 挂载在 Netty Pipeline 最前端，负责 TCP 拆包聚合，只有扫描定位到有效 JWT 行后再向后透传。
@@ -59,7 +61,7 @@ public class NettyJwtHeaderAccumulatorHandler extends ChannelDuplexHandler {
                     downstreamBuf = input;
                 } else {
                     // 状态 B：首包 Header 已收齐 (\r\n\r\n)，但未找到有效 JWT -> 直接响应 401 Unauthorized 并释放 ByteBuf
-                    rejectAndRelease(ctx, input, 401, SecurityResponses.RESPONSE_401, "Missing or Invalid JWT Token");
+                    rejectAndRelease(ctx, input, 401, SecurityResponses.RESPONSE_401, RateLimitReasonCodes.REASON_ANONYMOUS_UNAUTHORIZED);
                     return;
                 }
             } else {
@@ -90,7 +92,7 @@ public class NettyJwtHeaderAccumulatorHandler extends ChannelDuplexHandler {
                 downstreamBuf = cumulation;
             } else {
                 // 状态 B：多包积压聚合后 Header 已收齐 (\r\n\r\n)，但未找到有效 JWT -> 直接响应 401 Unauthorized 并释放 ByteBuf
-                rejectAndRelease(ctx, cumulation, 401, SecurityResponses.RESPONSE_401, "Missing or Invalid JWT Token");
+                rejectAndRelease(ctx, cumulation, 401, SecurityResponses.RESPONSE_401, RateLimitReasonCodes.REASON_ANONYMOUS_UNAUTHORIZED);
                 return;
             }
         }
@@ -135,12 +137,12 @@ public class NettyJwtHeaderAccumulatorHandler extends ChannelDuplexHandler {
     private void rejectExceededHeader(ChannelHandlerContext ctx, ByteBuf cumulation) {
         ctx.channel().attr(SecurityAttributeKeys.CUMULATION).set(null);
         cumulation.release();
-        notifyListener(ctx, 400, "HTTP Header Size Exceeded");
+        notifyListener(ctx, 400, RateLimitReasonCodes.REASON_HEADER_ACCUMULATION_OVERFLOW);
         sendResponseAndClose(ctx, SecurityResponses.RESPONSE_400.retainedDuplicate());
     }
 
-    private void rejectAndRelease(ChannelHandlerContext ctx, ByteBuf buf, int code, ByteBuf responseBuf, String reason) {
-        notifyListener(ctx, code, reason);
+    private void rejectAndRelease(ChannelHandlerContext ctx, ByteBuf buf, int code, ByteBuf responseBuf, int reasonCode) {
+        notifyListener(ctx, code, reasonCode);
         sendResponseAndClose(ctx, responseBuf.retainedDuplicate());
         buf.release();
     }
@@ -149,13 +151,19 @@ public class NettyJwtHeaderAccumulatorHandler extends ChannelDuplexHandler {
         ctx.writeAndFlush(responseBuf).addListener(io.netty.channel.ChannelFutureListener.CLOSE);
     }
 
-    private void notifyListener(ChannelHandlerContext ctx, int code, String reason) {
+    private void notifyListener(ChannelHandlerContext ctx, int code, int reasonCode) {
         if (eventListener != null) {
             try {
-                Long ip4 = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV4_LONG).get();
-                String clientIp = ip4 != null && ip4 != 0 ? com.netty.limiter.util.ZeroGcNumberUtil.formatIpToString(ip4) : "";
+                Long ipHighAttr = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV6_HIGH).get();
+                Long ipLowAttr = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV6_LOW).get();
+                long ipHigh = ipHighAttr != null ? ipHighAttr : 0L;
+                long ipLow = ipLowAttr != null ? ipLowAttr : 0L;
+                if (ipHigh == 0L && ipLow == 0L) {
+                    Long ip4 = ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV4_LONG).get();
+                    ipLow = ip4 != null ? ip4 : 0L;
+                }
                 Long userId = ctx.channel().attr(SecurityAttributeKeys.USER_ID).get();
-                eventListener.onRateLimitTriggered(clientIp, userId != null ? userId : 0L, code, reason);
+                eventListener.onRateLimitTriggered(ipHigh, ipLow, userId != null ? userId : 0L, code, reasonCode);
             } catch (Exception e) {
                 log.error("Failed to notify RateLimitEventListener", e);
             }

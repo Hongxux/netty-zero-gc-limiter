@@ -15,17 +15,15 @@ public enum JwtUidHeaderSecurityHandler implements HeaderSecurityHandler {
     INSTANCE;
 
     @Override
-    public LocalBanCache.BanInfo processHeaderValue(ByteBuf buf, int valueStart, int maxLen, ChannelHandlerContext ctx, LocalBanCache localBanCache) {
+    public void processHeaderValue(ByteBuf buf, int valueStart, int maxLen, ChannelHandlerContext ctx, LocalBanCache localBanCache) {
         long userId = ZeroGcJwtParser.INSTANCE.authenticateJwtAndExtractUid(buf, valueStart, maxLen);
         if (userId <= 0) {
-            return null;
+            return;
         }
 
         if (ctx != null) {
             ctx.channel().attr(SecurityAttributeKeys.USER_ID).set(userId);
         }
-
-        return localBanCache.getUserBanInfo(userId);
     }
 
     @Override

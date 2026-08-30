@@ -81,10 +81,11 @@ public class JwtHeaderSecurityHandler {
 
     public static final int STATUS_PASSED = 0;
     public static final int STATUS_USER_BANNED = 1;
-    public static final int STATUS_INVALID_JWT = 2;
+    public static final int STATUS_INVALID_JWT = 2; // 签名伪造 / 篡改 / 畸形 Token (401 + 封 IP 300s)
+    public static final int STATUS_EXPIRED_JWT = 3; // 签名有效，仅 Token 自然过期 (仅 401，不封 IP)
 
     /**
-     * 🚀 100% 0-GC JWT 物理签名鉴权与 UID 黑名单校验 (返回原生 int 状态码: 0=通过, 1=黑名单, 2=非法JWT)
+     * 🚀 100% 0-GC JWT 物理签名鉴权与 UID 黑名单校验 (返回原生 int 状态码: 0=通过, 1=黑名单, 2=非法JWT, 3=已过期JWT)
      */
     public int authenticateJwtAndCheckBanStatus(ByteBuf buf, ChannelHandlerContext ctx, LocalBanCache localBanCache) {
         Long cachedUserId = ctx != null ? ctx.channel().attr(SecurityAttributeKeys.USER_ID).get() : null;
@@ -112,8 +113,11 @@ public class JwtHeaderSecurityHandler {
                     ctx.channel().attr(SecurityAttributeKeys.USER_ID).set(userId);
                 }
                 return localBanCache.isUserBanned(userId) ? STATUS_USER_BANNED : STATUS_PASSED;
+            } else if (userId == -2L) {
+                // 签名校验通过，但 Token 已自然过期，返回 STATUS_EXPIRED_JWT (仅 401 拦截，不封 IP)
+                return STATUS_EXPIRED_JWT;
             } else {
-                // JWT 校验失败 (返回 0L，代表非法签名/畸形/已过期)，返回 STATUS_INVALID_JWT 触发 401 拦截
+                // 签名校验失败/篡改/畸形，返回 STATUS_INVALID_JWT (401 + 封 IP 300s)
                 return STATUS_INVALID_JWT;
             }
         }

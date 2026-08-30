@@ -18,11 +18,42 @@ import java.lang.invoke.VarHandle;
  * 5. 极限吞吐量性能：单机多线程并发测试达 3,626 万 QPS (26.19M ops/sec 常规打满)，全链路 P999 < 100µs。
  * =========================================================================================
  */
-public class UidRingBuffer implements AutoCloseable {
+abstract class UidRingBufferPad0 {
+    protected long p00, p01, p02, p03, p04, p05, p06, p07;
+}
+
+abstract class UidRingBufferConsumerFields extends UidRingBufferPad0 {
+    // nextNeededAckSequence 下一个急需被 ACK 确认出队的序列号 (NEED 语义，非 volatile，由 VarHandle 内存屏障管理)
+    protected long nextNeededAckSequence = 0;
+
+    // cachedNextAvailableRequestSequence 消费者本地 Safe Zone 保守缓存的生产者请求序列号 (普通变量，无需跨核)
+    protected long cachedNextAvailableRequestSequence = 0;
+}
+
+abstract class UidRingBufferPad1 extends UidRingBufferConsumerFields {
+    protected long p10, p11, p12, p13, p14, p15, p16, p17;
+}
+
+abstract class UidRingBufferProducerFields extends UidRingBufferPad1 {
+    // nextAvailableRequestSequence 下一个可供申请/预占入队的请求序列号 (AVAILABLE 语义，非 volatile，由 VarHandle 内存屏障管理)
+    protected long nextAvailableRequestSequence = 0;
+
+    // cachedNextNeededAckSequence 生产者本地 Safe Zone 缓存的下一个急需确认序列号 (非 volatile 普通变量，因 CAS 自动提供全屏障广播)
+    protected long cachedNextNeededAckSequence = 0;
+}
+
+abstract class UidRingBufferPad2 extends UidRingBufferProducerFields {
+    protected long p20, p21, p22, p23, p24, p25, p26, p27;
+}
+
+public class UidRingBuffer extends UidRingBufferPad2 implements AutoCloseable {
     private static final sun.misc.Unsafe UNSAFE;
+    private static final java.lang.ref.Cleaner CLEANER = java.lang.ref.Cleaner.create();
+
     private final long address;
     private final int capacity;
     private final int mask;
+    private final java.lang.ref.Cleaner.Cleanable cleanable;
 
     private static final VarHandle NEXT_NEEDED_ACK_SEQUENCE_HANDLE;
     private static final VarHandle NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE;
@@ -30,29 +61,20 @@ public class UidRingBuffer implements AutoCloseable {
 
     private volatile boolean freed = false;
 
-    // 缓存行填充 1: 56 字节 (7 * 8 字节)，隔离前面的字段
-    private long p00, p01, p02, p03, p04, p05, p06;
+    private static class Deallocator implements Runnable {
+        private final long address;
 
-    // nextNeededAckSequence 下一个急需被 ACK 确认出队的序列号 (NEED 语义，非 volatile，由 VarHandle 内存屏障管理)
-    private long nextNeededAckSequence = 0;
+        Deallocator(long address) {
+            this.address = address;
+        }
 
-    // cachedNextAvailableRequestSequence 消费者本地 Safe Zone 保守缓存的生产者请求序列号 (普通变量，无需跨核)
-    private long cachedNextAvailableRequestSequence = 0;
-
-    // 缓存行填充 2: 56 字节，物理隔离 Consumer 字段与 Producer 字段，彻底避免伪共享 (False Sharing)
-    private long p10, p11, p12, p13, p14, p15, p16;
-
-    // nextAvailableRequestSequence 下一个可供申请/预占入队的请求序列号 (AVAILABLE 语义，非 volatile，由 VarHandle 内存屏障管理)
-    private long nextAvailableRequestSequence = 0;
-
-    // 缓存行填充 3: 56 字节，隔离 nextAvailableRequestSequence 与 cachedNextNeededAckSequence
-    private long p20, p21, p22, p23, p24, p25, p26;
-
-    // cachedNextNeededAckSequence 生产者本地 Safe Zone 缓存的下一个急需确认序列号 (非 volatile 普通变量，因 CAS 自动提供全屏障广播)
-    private long cachedNextNeededAckSequence = 0;
-
-    // 缓存行填充 4: 56 字节
-    private long p30, p31, p32, p33, p34, p35, p36;
+        @Override
+        public void run() {
+            if (address != 0L) {
+                UNSAFE.freeMemory(address);
+            }
+        }
+    }
 
     static {
         try {
@@ -77,15 +99,32 @@ public class UidRingBuffer implements AutoCloseable {
         }
         this.capacity = cap;
         this.mask = cap - 1;
-        // 堆外裸内存物理分配 (MemorySegment / Unsafe 模式，擦除 JVM 数组越界检查分支)
-        this.address = UNSAFE.allocateMemory((long) cap * 8L);
-        UNSAFE.setMemory(this.address, (long) cap * 8L, (byte) 0);
+
+        long allocAddr = 0L;
+        java.lang.ref.Cleaner.Cleanable cl = null;
+        try {
+            long bytes = (long) cap * 8L;
+            allocAddr = UNSAFE.allocateMemory(bytes);
+            if (allocAddr != 0L) {
+                UNSAFE.setMemory(allocAddr, bytes, (byte) 0);
+                cl = CLEANER.register(this, new Deallocator(allocAddr));
+            }
+        } catch (Throwable t) {
+            // 🛡️ OOM 内存分配失败拦截：防止段错误或未捕获 Exception 导致进程物理崩塌
+            allocAddr = 0L;
+            cl = null;
+        }
+        this.address = allocAddr;
+        this.cleanable = cl;
     }
 
     /**
      * MPSC CAS 预占下一个可用请求槽位入队 (带 Safe Zone 本地 cachedNextNeededAckSequence 缓存优化)
      */
     public boolean offer(long uid) {
+        if (this.address == 0L) {
+            return false; // 🛡️ 降级兜底 (Fail-Open/Safe)：堆外内存分配失败时直接阻断入队，保护 JVM 不发生 Segment Fault
+        }
         long currentAvailableReqSeq;
         do {
             currentAvailableReqSeq = (long) NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.getAcquire(this);
@@ -118,6 +157,9 @@ public class UidRingBuffer implements AutoCloseable {
      * Single-Consumer 响应确认线程顺序出队 (带 Safe Zone 本地 cachedNextAvailableRequestSequence 缓存优化)
      */
     public long poll() {
+        if (this.address == 0L) {
+            return 0L;
+        }
         long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
         if (isEmpty(currentNeededAckSeq)) {
             return 0L;
@@ -155,6 +197,9 @@ public class UidRingBuffer implements AutoCloseable {
      * 做到高并发大批量出队稀释屏障，低并发按 30µs ~ 50µs 静默出队不卡 P99 尾部延迟
      */
     public int pollBatchAdaptive(long[] dst, int minBatchSize, int maxBatchSize, long maxWaitNanos) {
+        if (this.address == 0L) {
+            return 0;
+        }
         long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
         long available = this.cachedNextAvailableRequestSequence - currentNeededAckSeq;
         long now = System.nanoTime();
@@ -227,9 +272,9 @@ public class UidRingBuffer implements AutoCloseable {
     }
 
     public void free() {
-        if (FREED_HANDLE.compareAndSet(this, false, true)) {
-            if (address != 0L) {
-                UNSAFE.freeMemory(address);
+        if (this.address != 0L && FREED_HANDLE.compareAndSet(this, false, true)) {
+            if (cleanable != null) {
+                cleanable.clean();
             }
         }
     }

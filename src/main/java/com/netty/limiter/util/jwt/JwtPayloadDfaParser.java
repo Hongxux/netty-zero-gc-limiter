@@ -85,16 +85,18 @@ public class JwtPayloadDfaParser {
             p++;
         }
 
-        // 纯栈原语校验：判断 UID 是否合法且未过期 (没有 exp 字段或已过期直接返回 0L)
+        // 纯栈原语校验：判断 UID 是否合法且未过期 (没有 exp 字段或已过期返回 -2L 哨兵值)
         if (uid > 0) {
             long nowSec = System.currentTimeMillis() / 1000;
             if (isNotExpired(expSec, nowSec)) {
                 // 鉴权成功：回写 0-GC 双静态 Flat Table 缓存供后续 Fast Path 命中 (二重防碰撞)
                 JwtSigUidCache.INSTANCE.put(sigHash, sigPrefix, uid, expSec);
                 return uid;
+            } else {
+                return -2L; // 签名合法但 Token 已过期/无exp字段
             }
         }
-        return 0L;
+        return -1L;
     }
 
     /**

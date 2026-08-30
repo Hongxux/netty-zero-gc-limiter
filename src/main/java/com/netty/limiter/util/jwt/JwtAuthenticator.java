@@ -52,8 +52,9 @@ public class JwtAuthenticator {
                 long ver = SECRET_KEY_VERSION;
                 mac.init(keySpec);
                 return new MacHolderWrapper(mac, ver);
-            } catch (Exception e) {
-                throw new IllegalStateException("Failed to initialize HMAC-SHA256 Mac instance", e);
+            } catch (Throwable t) {
+                // 🛡️ 异常防御降级：禁止抛出 Uncaught Exception 打垮 Netty EventLoop
+                return new MacHolderWrapper(null, 0L);
             }
         }
     };
@@ -82,7 +83,7 @@ public class JwtAuthenticator {
     private static final byte[] BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".getBytes(StandardCharsets.UTF_8);
 
     /**
-     * 0-GC 验证 JWT Signature 是否与 Header + Payload 内容强契合
+     * 0-GC 验证 JWT Signature 是否与 Header + Payload 内容强契合 (带 Fail-Secure 安全降级保护)
      */
     public static boolean verifyJwtSignature0Gc(ByteBuf buf, int jwtStart, int dot2Index, int sigStart, int sigEnd) {
         int contentLen = dot2Index - jwtStart;
@@ -97,16 +98,24 @@ public class JwtAuthenticator {
         }
 
         MacHolderWrapper wrapper = HMAC_SHA256_HOLDER.get();
+        if (wrapper == null || wrapper.mac == null) {
+            // 🛡️ 降级兜底：HMAC 引擎不可用时快速拒绝 (Fail-Secure)，安全降级
+            return false;
+        }
         Mac mac = wrapper.mac;
         if (wrapper.keyVersion != SECRET_KEY_VERSION) {
             try {
                 mac.init(CURRENT_SECRET_KEY_SPEC);
                 wrapper.keyVersion = SECRET_KEY_VERSION;
-            } catch (Exception e) {
+            } catch (Throwable t) {
                 return false;
             }
         }
-        mac.reset();
+        try {
+            mac.reset();
+        } catch (Throwable t) {
+            return false;
+        }
 
         // 🚀 彻底消除 ByteBuf.nioBuffer() 带来的 ByteBuffer 包装对象分配，100% 0-GC 拷贝至 FastThreadLocal 数组
         buf.getBytes(jwtStart, contentBuf, 0, contentLen);

@@ -28,7 +28,7 @@ public enum IpHeaderSecurityHandler implements HeaderSecurityHandler {
     };
 
     @Override
-    public LocalBanCache.BanInfo processHeaderValue(ByteBuf buf, int valueStart, int maxLen, ChannelHandlerContext ctx, LocalBanCache localBanCache) {
+    public void processHeaderValue(ByteBuf buf, int valueStart, int maxLen, ChannelHandlerContext ctx, LocalBanCache localBanCache) {
         long[] ip4Out = IPV4_HOLDER.get();
         long[] ip6Out = IPV6_HOLDER.get();
 
@@ -42,8 +42,6 @@ public enum IpHeaderSecurityHandler implements HeaderSecurityHandler {
                 ctx.channel().attr(SecurityAttributeKeys.CLIENT_IPV6_LOW).set(ip6Out[1]);
             }
         }
-
-        return null;
     }
 
     @Override

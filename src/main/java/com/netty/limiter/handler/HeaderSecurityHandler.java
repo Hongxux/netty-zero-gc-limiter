@@ -9,7 +9,7 @@ import io.netty.channel.ChannelHandlerContext;
  **/
 public interface HeaderSecurityHandler {
 
-    LocalBanCache.BanInfo processHeaderValue(ByteBuf buf, int valueStart, int maxLen, ChannelHandlerContext ctx, LocalBanCache localBanCache);
+    void processHeaderValue(ByteBuf buf, int valueStart, int maxLen, ChannelHandlerContext ctx, LocalBanCache localBanCache);
 
     int getHandlerFlag();
 }

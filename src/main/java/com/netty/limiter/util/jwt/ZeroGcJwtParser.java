@@ -39,20 +39,21 @@ public enum ZeroGcJwtParser {
     private long parseAndAuthenticateJwt(ByteBuf buf, int jwtStart, int max) {
         int dot1 = buf.indexOf(jwtStart, max, (byte) '.');
         if (dot1 < 0) {
-            return parsePlainUidNumber(buf, jwtStart, max - jwtStart);
+            long uid = parsePlainUidNumber(buf, jwtStart, max - jwtStart);
+            return uid > 0 ? uid : -1L;
         }
 
         int payloadStart = dot1 + 1;
         int dot2 = buf.indexOf(payloadStart, max, (byte) '.');
         if (dot2 < 0) {
-            return 0L;
+            return -1L;
         }
 
         int payloadEnd = dot2;
         int sigStart = dot2 + 1;
         int sigEnd = findHeaderValueEnd(buf, sigStart, max);
         if (sigEnd <= sigStart) {
-            return 0L;
+            return -1L;
         }
 
         // 1. 【快路径 Fast Path】：提取 8 字节签名前缀，计算 64-bit xxHash64，二重校验防碰撞
@@ -92,7 +93,7 @@ public enum ZeroGcJwtParser {
         // 1. 0-GC HMAC-SHA256 物理签名校验
         boolean sigValid = JwtAuthenticator.verifyJwtSignature0Gc(buf, jwtStart, dot2, sigStart, sigEnd);
         if (!sigValid) {
-            return 0L; // 签名错误，非法 JWT！
+            return -1L; // 签名错误，非法/篡改 JWT！
         }
 
         // 2. DFA 流式解码 Base64URL 提炼 UID & EXP 并完成校验与 0-GC 缓存回写 (纯栈原语运算, 0 堆分配, 0 数组, 0 装箱)
