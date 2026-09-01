@@ -183,7 +183,7 @@ flowchart TD
 #### 1. 0-STW 无锁双表轮转 LRU 架构 (`JwtSigUidCache` & `LocalBanCache`)
 * **Hot/Cold 静态预分配**：系统初始化时静态预分配容量为 65,536 的 Flat 数组对（Hot Table 与 Cold Table），生命周期与进程绑定，永不销毁。
 * **原子指针切换与 SIMD 0-GC 清空**：
-  当 Hot Table 装载率达到黄金阈值 **40% (26,214 槽位)** 时，CAS 原子互换 `hot` 与 `cold` 指针。清空旧表时采用 `Arrays.fill(entries, 0L)`，HotSpot JIT 自动将其编译为底层 **AVX2/AVX-512 向量化 SIMD 指令**，耗时仅几微秒，随后以 `VarHandle.storeStoreFence()` 保证内存屏障刷盘。全生命周期 **0 堆内存分配、0 STW 停顿**。
+  当 Hot Table 装载率达到黄金阈值 **40% (26,214 槽位)** 时，CAS 原子互换 `hot` 与 `cold` 指针。清空旧表时采用 `Arrays.fill(entries, 0L)`，HotSpot JIT 自动将其编译为底层 **AVX2/AVX-512 向量化 SIMD 指令**，耗时仅几微秒；随后以 `VarHandle.storeStoreFence()` 插入 StoreStore 写写内存屏障，严防 CPU 与 JIT 发生写写指令重排序（StoreStore Reordering），确保数组底层的批量清零操作严格在计数器 `count.set(0)` 重置与后续指针发布之前提交并对多核 CPU 可见。全生命周期 **0 堆内存分配、0 STW 停顿**。
 * **冷到热无锁晋升**：读请求未命中 Hot Table 但在 Cold Table 中命中时，异步向 Hot Table 写入完成冷热晋升，以粗粒度双表轮转完美替代开销昂贵的精确 LRU 链表。
 
 #### 2. 64-bit 位域压缩 (Bit-Packing)

@@ -345,7 +345,7 @@ public class UserRateLimiterOperate {
 
 
     /**
-     * 核心 Pipeline 刷盘方法：循环 long[] 数组追加 count 条 RESP2 命令至单个 Direct ByteBuf 一次性发送
+     * 核心 Pipeline 批量刷出与网络发送方法：循环 long[] 数组追加 count 条 RESP2 命令至单个 Direct ByteBuf 一次性发送
      */
     public void flushLongArrayPipeline(long[] uids, int count, byte[] luaShaBytes) {
         if (redisChannel == null || !redisChannel.isActive() || count <= 0) {
