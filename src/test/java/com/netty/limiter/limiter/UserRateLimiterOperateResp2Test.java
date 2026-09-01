@@ -22,7 +22,7 @@ class UserRateLimiterOperateResp2Test {
                     "0123456789012345678901234567890123456789".getBytes(StandardCharsets.US_ASCII),
                     10086L);
             String command = buf.toString(StandardCharsets.US_ASCII);
-            assertTrue(command.startsWith("*8\r\n$7\r\nEVALSHA\r\n"));
+            assertTrue(command.startsWith("*9\r\n$7\r\nEVALSHA\r\n"));
             assertTrue(command.contains("$5\r\n10086\r\n"));
             assertTrue(command.contains("$2\r\n20\r\n"));
             assertTrue(command.endsWith("$1\r\n1\r\n"));

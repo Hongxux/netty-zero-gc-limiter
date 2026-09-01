@@ -35,7 +35,7 @@ public class AsyncRateLimitContext {
     public long userId;
     public int index;
 
-    public final AtomicInteger state = new AtomicInteger(STATE_UNPUBLISHED);
+    private final AtomicInteger state = new AtomicInteger(STATE_UNPUBLISHED);
 
     private static final Recycler<AsyncRateLimitContext> RECYCLER = new Recycler<AsyncRateLimitContext>() {
         @Override
@@ -64,6 +64,51 @@ public class AsyncRateLimitContext {
         ctx.index = 0;
         ctx.state.set(STATE_UNPUBLISHED);
         return ctx;
+    }
+
+    /**
+     * 🎯 生产者完成槽位写入后，以 Release 语义立下内存屏障，发布为 STATE_INIT 状态
+     */
+    public void publish() {
+        this.state.setRelease(STATE_INIT);
+    }
+
+    /**
+     * 🎯 判定当前槽位是否仍在发布中途 (Acquire 语义读取)
+     */
+    public boolean isUnpublished() {
+        return this.state.getAcquire() == STATE_UNPUBLISHED;
+    }
+
+    /**
+     * 🎯 Redis 回包或快速决议：尝试原子抢占状态为 STATE_RESOLVED
+     * @return true 若抢占成功，false 若已被超时或取消抢先决议
+     */
+    public boolean tryResolve() {
+        return this.state.compareAndSet(STATE_INIT, STATE_RESOLVED);
+    }
+
+    /**
+     * 🎯 50ms 时间轮超时到达：尝试原子抢占状态为 STATE_TIMEOUT
+     * @return true 若抢占成功，false 若已被正常响应或取消抢先决议
+     */
+    public boolean tryTimeout() {
+        return this.state.compareAndSet(STATE_INIT, STATE_TIMEOUT);
+    }
+
+    /**
+     * 🎯 队列溢出、网络断开或发送异常：尝试原子抢占状态为 STATE_CANCELLED
+     * @return true 若抢占成功，false 若已被处理
+     */
+    public boolean tryCancel() {
+        return this.state.compareAndSet(STATE_INIT, STATE_CANCELLED);
+    }
+
+    /**
+     * 读取当前状态 (主要用于单元测试与状态探查)
+     */
+    public int getState() {
+        return this.state.get();
     }
 
     /**

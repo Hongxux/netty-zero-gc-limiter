@@ -18,7 +18,7 @@ import java.lang.invoke.VarHandle;
  *    - `offer()` 在 EventLoop 线程中与 `writeAndFlush()` 顺序执行。
  *    - 确保：EventLoop 任务队列顺序 == RingBuffer 序列号顺序 == Netty TCP Write 顺序 == Redis 响应顺序 (100% 绝对一致，零并发倒置隐患)。
  * 5. CANCELLED_SLOT 哨兵原子脱钩 (COW Atomic Cancel)：
- *    - 50ms 超时未收到 Redis 响应时，通过 CAS (`ARRAY_VH.compareAndSet`) 将 array[index] 原子替换为 `CANCELLED_SLOT` 哨兵，彻底解决对象别名 (Aliasing Bug)。
+ *    - 50ms 超时未收到 Redis 响应时，通过 CAS (`ARRAY_VH.compareAndSet`) 将 array[index] 原子替换为 `CANCELLED_SLOT` 哨兵，彻底防御对象池复用引发的“幽灵唤醒/串包污染” (Anti-Phantom Wakeup)。
  * =========================================================================================
  */
 abstract class SyncWaitSlotRingBufferPad0 {
@@ -92,11 +92,11 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         int index = (int) (currentAvailableReqSeq & mask);
         ctx.index = index;
 
-        // 1. 先写入数组槽位
+        // 1. 普通写写入数组槽位 (开销最低，无需额外 StoreStore 屏障)
         ARRAY_VH.set(array, index, ctx);
 
-        // 🎯 2. 终极发布屏障：以 setRelease 发布 STATE_INIT，保证上方所有字段对 Consumer getAcquire 严格可见
-        ctx.state.setRelease(AsyncRateLimitContext.STATE_INIT);
+        // 🎯 2. 统一发布门禁：以 setRelease 发布 STATE_INIT，立下 StoreStore 屏障，保证上方普通写与 ctx 内部字段对 Consumer getAcquire 严格可见
+        ctx.publish();
         return true;
     }
 
@@ -144,7 +144,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         if (ctx == CANCELLED_CONTEXT) {
             return false;
         }
-        return ctx.state.getAcquire() == AsyncRateLimitContext.STATE_UNPUBLISHED;
+        return ctx.isUnpublished();
     }
 
     /**

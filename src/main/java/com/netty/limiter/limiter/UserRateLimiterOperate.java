@@ -47,7 +47,7 @@ public class UserRateLimiterOperate {
     private LocalBanCache localBanCache;
 
     private static final byte[] PING_CMD_BYTES = "*1\r\n$4\r\nPING\r\n".getBytes(StandardCharsets.US_ASCII);
-    private static final byte[] EVALSHA_CMD_PREFIX = "*8\r\n$7\r\nEVALSHA\r\n".getBytes(StandardCharsets.US_ASCII);
+    private static final byte[] EVALSHA_CMD_PREFIX = "*9\r\n$7\r\nEVALSHA\r\n".getBytes(StandardCharsets.US_ASCII);
     private static final byte[] SCRIPT_LOAD_PREFIX = "*3\r\n$6\r\nSCRIPT\r\n$4\r\nLOAD\r\n".getBytes(StandardCharsets.US_ASCII);
     private static final byte[] CRLF = {'\r', '\n'};
 
@@ -67,8 +67,12 @@ public class UserRateLimiterOperate {
     private volatile int reconnectAttempts = 0;
 
     // =========================================================================================
+    // =========================================================================================
     // 🚀 模式 A：FastThreadLocal 线程本地 0-GC long[] 攒批缓冲区 (0 跨核、0 CAS 锁开销)
     // =========================================================================================
+    private static final int BATCH_SIZE = 32;
+    private static final long BATCH_TIMEOUT_NANOS = 50_000L; // 50微秒自适应刷新
+
     private static class ThreadRedisBatchBuffer {
         final long[] uids = new long[64]; // 容量 64 long 数组
         int count = 0;
@@ -87,7 +91,35 @@ public class UserRateLimiterOperate {
                 flushLongArrayPipeline(buffer.uids, buffer.count, luaShaBytes);
                 buffer.count = 0;
             }
-            // 🛡️ 引用解绑：移除该 FastThreadLocal 槽位引用，彻底避免 JVM 热重载 ClassLoader 物理泄露
+            FastThreadLocal.removeAll();
+        }
+    };
+
+    // =========================================================================================
+    // 🚀 模式 B：FastThreadLocal 线程本地 AsyncRateLimitContext[] 响应式双阈值微攒批缓冲区
+    // (数量 16条 + 时间 50µs 双阈值自适应触发，0 跨核锁竞争、0 堆对象分配)
+    // =========================================================================================
+    private static final int REACTIVE_BATCH_SIZE = 16;
+    private static final long REACTIVE_BATCH_TIMEOUT_NANOS = 50_000L; // 50微秒自适应刷新
+
+    private static class ThreadReactiveBatchBuffer {
+        final AsyncRateLimitContext[] contexts = new AsyncRateLimitContext[32];
+        int count = 0;
+        long lastFlushNanos = System.nanoTime();
+    }
+
+    private final FastThreadLocal<ThreadReactiveBatchBuffer> THREAD_REACTIVE_BATCH_BUFFER = new FastThreadLocal<ThreadReactiveBatchBuffer>() {
+        @Override
+        protected ThreadReactiveBatchBuffer initialValue() {
+            return new ThreadReactiveBatchBuffer();
+        }
+
+        @Override
+        protected void onRemoval(ThreadReactiveBatchBuffer buffer) throws Exception {
+            if (buffer != null && buffer.count > 0) {
+                acquireReactiveBatchAsync(buffer.contexts, buffer.count, luaShaBytes);
+                buffer.count = 0;
+            }
             FastThreadLocal.removeAll();
         }
     };
@@ -143,6 +175,21 @@ public class UserRateLimiterOperate {
                                 protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
                                     int start = msg.readerIndex();
                                     int end = msg.writerIndex();
+                                    if (start >= end) return;
+
+                                    // 🛡️ Redis 错误报文快速失败处理 (如 -NOSCRIPT, -ERR 等)
+                                    if (msg.getByte(start) == '-') {
+                                        log.error("Redis returned error in Mode B: {}", msg.toString(java.nio.charset.StandardCharsets.UTF_8));
+                                        AsyncRateLimitContext errCtx = syncWaitSlotRingBuffer.poll();
+                                        if (errCtx != null && errCtx != SyncWaitSlotRingBuffer.CANCELLED_CONTEXT) {
+                                            if (errCtx.tryCancel()) {
+                                                if (errCtx.timeoutHandle != null) errCtx.timeoutHandle.cancel();
+                                                errCtx.httpCtx.executor().execute(() -> errCtx.resume(false));
+                                            }
+                                        }
+                                        return;
+                                    }
+
                                     int colonIdx = msg.indexOf(start, end, (byte) ':');
                                     if (colonIdx < 0 || colonIdx >= end - 1) {
                                         return;
@@ -151,22 +198,31 @@ public class UserRateLimiterOperate {
                                     byte statusByte = msg.getByte(colonIdx + 1);
                                     int allowedFlag = (statusByte == '1') ? 1 : 0;
 
-                                    AsyncRateLimitContext expectedCtx = syncWaitSlotRingBuffer.peek();
-                                    if (expectedCtx != null) {
+                                    AsyncRateLimitContext expectedCtx;
+                                    while ((expectedCtx = syncWaitSlotRingBuffer.peek()) != null) {
                                         if (expectedCtx == SyncWaitSlotRingBuffer.CANCELLED_CONTEXT) {
-                                            // 🎯 遇到 50ms 超时已取消的 Context，出队 COW 替换 ZERO_CONTEXT，推进序列号，跳过唤醒！
+                                            // 🎯 遇到 50ms 超时已取消的 Context，出队推进队列
                                             syncWaitSlotRingBuffer.poll();
-                                        } else if (expectedCtx.userId == uidFromRedis) {
-                                            // 🎯 返回的 UID 与队头等待上下文的 UID 精确匹配！
-                                            syncWaitSlotRingBuffer.poll(); // COW 替换 ZERO_CONTEXT，原子清空槽位
-
-                                            // 🎯 原生响应式异步模式 (0-GC 调度回原 HTTP EventLoop)
-                                            if (expectedCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_RESOLVED)) {
-                                                if (expectedCtx.timeoutHandle != null) {
-                                                    expectedCtx.timeoutHandle.cancel();
+                                            continue;
+                                        }
+                                        if (expectedCtx.userId == uidFromRedis) {
+                                            // 🎯 返回的 UID 与队头精确匹配！
+                                            final AsyncRateLimitContext matchedCtx = expectedCtx;
+                                            syncWaitSlotRingBuffer.poll();
+                                            if (matchedCtx.tryResolve()) {
+                                                if (matchedCtx.timeoutHandle != null) {
+                                                    matchedCtx.timeoutHandle.cancel();
                                                 }
-                                                // 调度回原 HTTP Channel 的 EventLoop 线程执行！
-                                                expectedCtx.httpCtx.executor().execute(() -> expectedCtx.resume(allowedFlag == 1));
+                                                matchedCtx.httpCtx.executor().execute(() -> matchedCtx.resume(allowedFlag == 1));
+                                            }
+                                            break;
+                                        } else {
+                                            // 队头不匹配时快速出队并熔断，防止队头阻塞
+                                            final AsyncRateLimitContext mismatchedCtx = expectedCtx;
+                                            syncWaitSlotRingBuffer.poll();
+                                            if (mismatchedCtx.tryCancel()) {
+                                                if (mismatchedCtx.timeoutHandle != null) mismatchedCtx.timeoutHandle.cancel();
+                                                mismatchedCtx.httpCtx.executor().execute(() -> mismatchedCtx.resume(false));
                                             }
                                         }
                                     }
@@ -240,37 +296,57 @@ public class UserRateLimiterOperate {
     private final SyncWaitSlotRingBuffer syncWaitSlotRingBuffer = new SyncWaitSlotRingBuffer(1024);
 
     /**
-     * 🚀 模式 B 原生响应式无阻塞校验 (0-GC Reactive Async Non-Blocking Rate Limit):
-     * 针对 80% 水位预警 (-2L) UID 执行 RESP2 0-GC 异步 EVALSHA 扣减与非阻塞回调。
-     *
-     * 核心优势：
-     * 1. 0 线程阻塞：绝不调用 LockSupport.park，当前 EventLoop 线程立即释放；
-     * 2. 0 堆内存分配：基于 Recycler 池化的 AsyncRateLimitContext 直接入队 RingBuffer，无二层封装；
-     * 3. 50ms HashedWheelTimer 超时熔断与防孤儿泄漏；
-     * 4. Redis 响应后通过 asyncCtx.httpCtx.executor().execute() 精准调度回原 HTTP EventLoop 触发 asyncCtx.resume()。
+     * 🚀 模式 B 原生响应式无阻塞限流入口：
+     * 基于 FastThreadLocal 数量 (16条) + 时间 (50µs) 双阈值自适应微攒批 Pipeline，
+     * 在单 TCP 连接下兼具 10 万+ QPS 极限吞吐与微秒级极低延迟。
      */
     public void acquireReactiveAsync(AsyncRateLimitContext asyncCtx, byte[] luaShaBytes) {
         if (redisChannel == null || !redisChannel.isActive()) {
-            // 🛡️ Fail-Closed 降级保护：连接不可用时异步拒绝
-            asyncCtx.httpCtx.executor().execute(() -> {
-                if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_RESOLVED)) {
-                    asyncCtx.resume(false);
-                }
-            });
+            failClosed(asyncCtx);
             return;
         }
 
-        // 1. 注册 50ms 时间轮超时熔断任务
-        asyncCtx.timeoutHandle = HASHED_WHEEL_TIMER.newTimeout(timeout -> {
-            asyncCtx.httpCtx.executor().execute(() -> {
-                if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_TIMEOUT)) {
-                    // 超时快速拦截
-                    asyncCtx.resume(false);
-                }
-            });
-        }, 50, TimeUnit.MILLISECONDS);
+        ThreadReactiveBatchBuffer batchBuffer = THREAD_REACTIVE_BATCH_BUFFER.get();
+        batchBuffer.contexts[batchBuffer.count++] = asyncCtx;
+        long nowNanos = System.nanoTime();
 
-        // 2. 统一提交到 Redis EventLoop 串行入队并发送 TCP 字节流 (直接入队 AsyncRateLimitContext，0 二层包装)
+        // 🎯 数量 (16条) + 时间 (50µs) 双阈值自适应触发
+        if (batchBuffer.count >= REACTIVE_BATCH_SIZE || (nowNanos - batchBuffer.lastFlushNanos) >= REACTIVE_BATCH_TIMEOUT_NANOS) {
+            acquireReactiveBatchAsync(batchBuffer.contexts, batchBuffer.count, luaShaBytes);
+            batchBuffer.count = 0;
+            batchBuffer.lastFlushNanos = nowNanos;
+        }
+    }
+
+    public void acquireReactiveAsync(AsyncRateLimitContext asyncCtx) {
+        acquireReactiveAsync(asyncCtx, luaShaBytes);
+    }
+
+    /**
+     * 🚀 模式 B 强制刷新当前线程未满批次 (Flush Thread Buffer)
+     */
+    public void flushReactiveBatch(byte[] luaShaBytes) {
+        ThreadReactiveBatchBuffer batchBuffer = THREAD_REACTIVE_BATCH_BUFFER.get();
+        if (batchBuffer != null && batchBuffer.count > 0) {
+            acquireReactiveBatchAsync(batchBuffer.contexts, batchBuffer.count, luaShaBytes);
+            batchBuffer.count = 0;
+            batchBuffer.lastFlushNanos = System.nanoTime();
+        }
+    }
+
+    public void flushReactiveBatch() {
+        flushReactiveBatch(luaShaBytes);
+    }
+
+    /**
+     * 🚀 模式 B 单发直连限流入口：逐条单独构建 DirectByteBuf 刷入 Socket (无攒批 DirectFlush，用于极致单发对比)
+     */
+    public void acquireReactiveDirect(AsyncRateLimitContext asyncCtx, byte[] luaShaBytes) {
+        if (redisChannel == null || !redisChannel.isActive()) {
+            failClosed(asyncCtx);
+            return;
+        }
+        registerTimeoutTask(asyncCtx);
         redisChannel.eventLoop().execute(() -> {
             boolean offered = syncWaitSlotRingBuffer.offer(asyncCtx);
             if (offered) {
@@ -281,35 +357,133 @@ public class UserRateLimiterOperate {
                     redisChannel.writeAndFlush(buf);
                 } catch (Exception e) {
                     buf.release();
-                    log.error("Error encoding/sending 0-GC async EVALSHA command for userId: {}", asyncCtx.userId, e);
-                    // 🛡️ 发送异常快速失败：取消槽位、取消超时，并调度回原线程快速拦截
+                    log.error("Error sending 0-GC async EVALSHA for userId: {}", asyncCtx.userId, e);
                     syncWaitSlotRingBuffer.cancel(asyncCtx);
-                    if (asyncCtx.timeoutHandle != null) {
-                        asyncCtx.timeoutHandle.cancel();
-                    }
+                    if (asyncCtx.timeoutHandle != null) asyncCtx.timeoutHandle.cancel();
                     asyncCtx.httpCtx.executor().execute(() -> {
-                        if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_CANCELLED)) {
-                            asyncCtx.resume(false);
-                        }
+                        if (asyncCtx.tryCancel()) asyncCtx.resume(false);
                     });
                 }
             } else {
-                // 🛡️ 队列溢出快速失败 (RingBuffer Overflow Fail-Fast)：避免请求傻等 50ms 超时
-                log.warn("SyncWaitSlotRingBuffer overflow (full capacity 1024), fast-failing userId: {}", asyncCtx.userId);
-                if (asyncCtx.timeoutHandle != null) {
-                    asyncCtx.timeoutHandle.cancel();
-                }
+                if (asyncCtx.timeoutHandle != null) asyncCtx.timeoutHandle.cancel();
                 asyncCtx.httpCtx.executor().execute(() -> {
-                    if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_CANCELLED)) {
-                        asyncCtx.resume(false);
-                    }
+                    if (asyncCtx.tryCancel()) asyncCtx.resume(false);
                 });
             }
         });
     }
 
-    public void acquireReactiveAsync(AsyncRateLimitContext asyncCtx) {
-        acquireReactiveAsync(asyncCtx, luaShaBytes);
+    public void acquireReactiveDirect(AsyncRateLimitContext asyncCtx) {
+        acquireReactiveDirect(asyncCtx, luaShaBytes);
+    }
+
+    /**
+     * 🚀 Mode B 响应式自适应微攒批 (Reactive Micro-Batching Pipeline)：
+     * 将多个 AsyncRateLimitContext 一起打包进单个 Direct ByteBuf 一次性刷入 Socket，
+     * 大幅平摊系统调用开销与 Redis 单线程协议反序列化成本。
+     */
+    public void acquireReactiveBatchAsync(AsyncRateLimitContext[] batch, int count, byte[] luaShaBytes) {
+        if (count <= 0) return;
+        if (redisChannel == null || !redisChannel.isActive()) {
+            for (int i = 0; i < count; i++) {
+                failClosed(batch[i]);
+            }
+            return;
+        }
+
+        // 1. 为批次内每个 context 注册 50ms 超时时间轮
+        for (int i = 0; i < count; i++) {
+            registerTimeoutTask(batch[i]);
+        }
+
+        // 2. 统一提交到 Redis EventLoop 批量入队并以单个 Direct ByteBuf 刷入 Socket
+        redisChannel.eventLoop().execute(() -> {
+            long nowMs = System.currentTimeMillis();
+            int maxTokens = maxTokens();
+            int refillRate = refillRate();
+            int ttlSec = ttlSeconds();
+
+            ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(256 * count);
+            try {
+                for (int i = 0; i < count; i++) {
+                    AsyncRateLimitContext asyncCtx = batch[i];
+                    if (asyncCtx != null) {
+                        boolean offered = syncWaitSlotRingBuffer.offer(asyncCtx);
+                        if (offered) {
+                            encodeResp2EvalSha(buf, luaShaBytes, asyncCtx.userId, nowMs, maxTokens, refillRate, ttlSec, 1);
+                        } else {
+                            if (asyncCtx.timeoutHandle != null) asyncCtx.timeoutHandle.cancel();
+                            asyncCtx.httpCtx.executor().execute(() -> {
+                                if (asyncCtx.tryCancel()) {
+                                    asyncCtx.resume(false);
+                                }
+                            });
+                        }
+                    }
+                }
+                if (buf.isReadable()) {
+                    redisChannel.writeAndFlush(buf);
+                } else {
+                    buf.release();
+                }
+            } catch (Exception e) {
+                buf.release();
+                log.error("Error batch sending 0-GC async EVALSHA commands", e);
+            }
+        });
+    }
+
+    public void acquireReactiveBatchAsync(AsyncRateLimitContext[] batch, int count) {
+        acquireReactiveBatchAsync(batch, count, luaShaBytes);
+    }
+
+    /**
+     * 🛡️ 注册 Mode B 临界限流 50ms 超时熔断保护任务 (Fail-Fast & Timeout Circuit Breaker)
+     *
+     * 业务背景与设计目标：
+     * 1. 【80% 水位临界防悬挂】：
+     *    当用户进入 80% 水位临界预警（-2L）时，网关切入 Mode B 等待 Redis 强校验仲裁。
+     *    若因物理网络抖动、丢包或 Redis 服务端慢查询导致未在 50ms 内返回，请求绝不能无休止挂起占用连接与内存。
+     * 2. 【50ms HashedWheelTimer 时间轮轻量调度】：
+     *    采用高效的 Netty 时间轮以 O(1) 复杂度管理在途超时任务，杜绝为每个请求创建独立线程或 JDK ScheduledFuture 堆对象。
+     * 3. 【CAS 原子状态互斥与防双重唤醒】：
+     *    超时触发时通过 {@code asyncCtx.tryTimeout()}（CAS 将 STATE_INIT 原子置为 STATE_TIMEOUT），
+     *    与迟到的 Redis 正常回包（{@code tryResolve()}）严格物理互斥，确保仲裁结果仅能生效一次。
+     * 4. 【跨 EventLoop 线程安全调度与 0-GC 对象池闭环】：
+     *    通过 {@code asyncCtx.httpCtx.executor().execute(...)} 将执行权限无锁调度回原始 HTTP 绑定的 EventLoop 线程，
+     *    执行 {@code asyncCtx.resume(false)} 快速返回 403 拦截并安全回收续体对象至 Recycler 池，彻底杜绝孤儿请求与内存泄漏。
+     */
+    private void registerTimeoutTask(AsyncRateLimitContext asyncCtx) {
+        if (asyncCtx != null) {
+            final io.netty.channel.ChannelHandlerContext httpCtx = asyncCtx.httpCtx;
+            asyncCtx.timeoutHandle = HASHED_WHEEL_TIMER.newTimeout(timeout -> {
+                if (asyncCtx.tryTimeout()) {
+                    if (httpCtx != null && httpCtx.executor() != null) {
+                        httpCtx.executor().execute(() -> asyncCtx.resume(false));
+                    } else {
+                        asyncCtx.resume(false);
+                    }
+                }
+            }, 50, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * 🛡️ Redis 连接断开时的 Fail-Closed 异步安全拒绝 (Fail-Closed Safety Barrier)
+     *
+     * 业务背景：
+     * 处于 Mode B（80% 临界高危）的用户可能为突发恶意爬虫或黑产流量，当 Redis TCP 通道不可用时，
+     * 必须采取 Fail-Closed 策略严格拦截拒绝（403），严防攻击者利用 Redis 网络空窗期渗透击穿下游业务；
+     * 同时调度回原 HTTP EventLoop 触发 resume(false) 确保 0-GC 上下文闭环归还对象池。
+     */
+    private static void failClosed(AsyncRateLimitContext asyncCtx) {
+        if (asyncCtx != null) {
+            asyncCtx.httpCtx.executor().execute(() -> {
+                if (asyncCtx.tryResolve()) {
+                    asyncCtx.resume(false);
+                }
+            });
+        }
     }
 
     /**
