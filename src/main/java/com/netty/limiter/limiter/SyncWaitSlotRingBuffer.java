@@ -48,33 +48,16 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     public static final int MAX_SPIN_COUNT = 4096;
 
     /**
-     * 🎯 FTL per-thread Slot：每个生产者线程独占一个 SyncWaitSlot 实例，0-GC 复用，无跨线程写竞争。
+     * 🎯 ZERO_CONTEXT 哨兵：标识数组槽位为空（待生产者写入），COW 清空的原子占位对象。
      */
-    public static final FastThreadLocal<SyncWaitSlot> THREAD_SLOT = new FastThreadLocal<>() {
-        @Override
-        protected SyncWaitSlot initialValue() {
-            return new SyncWaitSlot();
-        }
-    };
+    public static final AsyncRateLimitContext ZERO_CONTEXT = new AsyncRateLimitContext(null);
 
     /**
-     * 🎯 ZERO_SLOT 哨兵：标识数组槽位为空（待生产者写入），COW 清空的原子占位对象。
+     * 🎯 CANCELLED_CONTEXT 哨兵：标识槽位因 50ms 超时被原子放弃，EventLoop 遇到此哨兵直接 poll() 推进队列。
      */
-    public static final SyncWaitSlot ZERO_SLOT = new SyncWaitSlot();
+    public static final AsyncRateLimitContext CANCELLED_CONTEXT = new AsyncRateLimitContext(null);
 
-    /**
-     * 🎯 CANCELLED_SLOT 哨兵：标识槽位因 50ms 超时被生产者原子放弃，EventLoop 遇到此哨兵直接 poll() 推进队列。
-     */
-    public static final SyncWaitSlot CANCELLED_SLOT = new SyncWaitSlot();
-
-    public static class SyncWaitSlot {
-        public long userId;
-        public int status;        // 0=pending, 1=passed, 2=blocked
-        public AsyncRateLimitContext asyncCtx; // 🎯 0-GC 响应式异步上下文
-        public int index;         // 🎯 记录当前 Slot 被放入 RingBuffer 的数组下标
-    }
-
-    private final SyncWaitSlot[] array;
+    private final AsyncRateLimitContext[] array;
     private final int mask;
 
     private static final VarHandle NEXT_NEEDED_ACK_SEQUENCE_HANDLE;
@@ -86,7 +69,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
             MethodHandles.Lookup l = MethodHandles.lookup();
             NEXT_NEEDED_ACK_SEQUENCE_HANDLE = l.findVarHandle(SyncWaitSlotRingBuffer.class, "nextNeededAckSequence", long.class);
             NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE = l.findVarHandle(SyncWaitSlotRingBuffer.class, "nextAvailableRequestSequence", long.class);
-            ARRAY_VH = MethodHandles.arrayElementVarHandle(SyncWaitSlot[].class);
+            ARRAY_VH = MethodHandles.arrayElementVarHandle(AsyncRateLimitContext[].class);
         } catch (ReflectiveOperationException e) {
             throw new ExceptionInInitializerError(e);
         }
@@ -95,11 +78,11 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     public SyncWaitSlotRingBuffer(int capacity) {
         int cap = 1;
         while (cap < capacity) cap <<= 1;
-        this.array = new SyncWaitSlot[cap];
+        this.array = new AsyncRateLimitContext[cap];
         this.mask = cap - 1;
-        // 初始化所有槽位为 ZERO_SLOT 哨兵
+        // 初始化所有槽位为 ZERO_CONTEXT 哨兵
         for (int i = 0; i < cap; i++) {
-            ARRAY_VH.setRelease(array, i, ZERO_SLOT);
+            ARRAY_VH.setRelease(array, i, ZERO_CONTEXT);
         }
     }
 
@@ -107,7 +90,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
      * MPSC/SPSC 生产者：CAS 原子抢占可用序列号，写入 index 并通过 ARRAY_VH.setRelease 原子发布引用。
      * 线程安全：使用 CAS 循环抢占 nextAvailableRequestSequence，彻底杜绝序列号覆盖与并发冲突隐患。
      */
-    public boolean offer(SyncWaitSlot slot) {
+    public boolean offer(AsyncRateLimitContext ctx) {
         long currentAvailableReqSeq;
         do {
             currentAvailableReqSeq = (long) NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.getAcquire(this);
@@ -117,25 +100,24 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         } while (!NEXT_AVAILABLE_REQUEST_SEQUENCE_HANDLE.compareAndSet(this, currentAvailableReqSeq, currentAvailableReqSeq + 1));
 
         int index = (int) (currentAvailableReqSeq & mask);
-        slot.index = index;
-        slot.status = 0;
+        ctx.index = index;
 
         // 🎯 单次 ARRAY_VH.setRelease = Release Fence：保证上方 plain 写入对 Consumer getAcquire 可见
-        ARRAY_VH.setRelease(array, index, slot);
+        ARRAY_VH.setRelease(array, index, ctx);
         return true;
     }
 
     /**
      * 🛡️ 生产者超时原子取消：
-     * 若 array[index] 中依然是当前 slot，则用 CAS 将其原子替换为 CANCELLED_SLOT 哨兵。
-     * 解除 FTL slot 在 RingBuffer 上的指针引用，防止对象别名 (Aliasing) 导致迟到响应误唤醒。
+     * 若 array[index] 中依然是当前 ctx，则用 CAS 将其原子替换为 CANCELLED_CONTEXT 哨兵。
+     * 解除 ctx 在 RingBuffer 上的指针引用，防止迟到响应误唤醒。
      */
-    public boolean cancel(SyncWaitSlot slot) {
-        if (slot == null || slot == ZERO_SLOT || slot == CANCELLED_SLOT) {
+    public boolean cancel(AsyncRateLimitContext ctx) {
+        if (ctx == null || ctx == ZERO_CONTEXT || ctx == CANCELLED_CONTEXT) {
             return false;
         }
-        int index = slot.index;
-        return ARRAY_VH.compareAndSet(array, index, slot, CANCELLED_SLOT);
+        int index = ctx.index;
+        return ARRAY_VH.compareAndSet(array, index, ctx, CANCELLED_CONTEXT);
     }
 
     private boolean isFull(long currentAvailableReqSeq) {
@@ -150,9 +132,9 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
     }
 
     /**
-     * SPSC Consumer peek：ARRAY_VH.getAcquire 有界自旋等待槽位非 ZERO_SLOT。
+     * SPSC Consumer peek：ARRAY_VH.getAcquire 有界自旋等待槽位非 ZERO_CONTEXT。
      */
-    public SyncWaitSlot peek() {
+    public AsyncRateLimitContext peek() {
         long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
         if (isEmpty(currentNeededAckSeq)) {
             return null;
@@ -160,20 +142,20 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         int index = (int) (currentNeededAckSeq & mask);
 
         int spins = 0;
-        SyncWaitSlot slot;
-        while ((slot = (SyncWaitSlot) ARRAY_VH.getAcquire(array, index)) == ZERO_SLOT) {
+        AsyncRateLimitContext ctx;
+        while ((ctx = (AsyncRateLimitContext) ARRAY_VH.getAcquire(array, index)) == ZERO_CONTEXT) {
             if (++spins > MAX_SPIN_COUNT) {
                 return null; // 🛡️ 防御性降级
             }
             Thread.onSpinWait();
         }
-        return slot;
+        return ctx;
     }
 
     /**
-     * SPSC Consumer poll：弹出队头 Slot，以 ARRAY_VH.setRelease(ZERO_SLOT) COW 原子清空槽位，推进序列号。
+     * SPSC Consumer poll：弹出队头 Context，以 ARRAY_VH.setRelease(ZERO_CONTEXT) COW 原子清空槽位，推进序列号。
      */
-    public SyncWaitSlot poll() {
+    public AsyncRateLimitContext poll() {
         long currentNeededAckSeq = (long) NEXT_NEEDED_ACK_SEQUENCE_HANDLE.getAcquire(this);
         if (isEmpty(currentNeededAckSeq)) {
             return null;
@@ -181,18 +163,18 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         int index = (int) (currentNeededAckSeq & mask);
 
         int spins = 0;
-        SyncWaitSlot slot;
-        while ((slot = (SyncWaitSlot) ARRAY_VH.getAcquire(array, index)) == ZERO_SLOT) {
+        AsyncRateLimitContext ctx;
+        while ((ctx = (AsyncRateLimitContext) ARRAY_VH.getAcquire(array, index)) == ZERO_CONTEXT) {
             if (++spins > MAX_SPIN_COUNT) {
                 return null;
             }
             Thread.onSpinWait();
         }
 
-        // COW 原子替换：单次 ARRAY_VH.setRelease 将槽位恢复为 ZERO_SLOT
-        ARRAY_VH.setRelease(array, index, ZERO_SLOT);
+        // COW 原子替换：单次 ARRAY_VH.setRelease 将槽位恢复为 ZERO_CONTEXT
+        ARRAY_VH.setRelease(array, index, ZERO_CONTEXT);
         NEXT_NEEDED_ACK_SEQUENCE_HANDLE.setRelease(this, currentNeededAckSeq + 1);
-        return slot;
+        return ctx;
     }
 
     private boolean isEmpty(long currentNeededAckSeq) {

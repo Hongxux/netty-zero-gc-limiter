@@ -151,33 +151,28 @@ public class UserRateLimiterOperate {
                                     byte statusByte = msg.getByte(colonIdx + 1);
                                     int allowedFlag = (statusByte == '1') ? 1 : 0;
 
-                                    SyncWaitSlotRingBuffer.SyncWaitSlot expectedSlot = syncWaitSlotRingBuffer.peek();
-                                    if (expectedSlot != null) {
-                                        if (expectedSlot == SyncWaitSlotRingBuffer.CANCELLED_SLOT) {
-                                            // 🎯 遇到 50ms 超时已取消的 Slot，出队 COW 替换 ZERO_SLOT，推进序列号，跳过唤醒！
+                                    AsyncRateLimitContext expectedCtx = syncWaitSlotRingBuffer.peek();
+                                    if (expectedCtx != null) {
+                                        if (expectedCtx == SyncWaitSlotRingBuffer.CANCELLED_CONTEXT) {
+                                            // 🎯 遇到 50ms 超时已取消的 Context，出队 COW 替换 ZERO_CONTEXT，推进序列号，跳过唤醒！
                                             syncWaitSlotRingBuffer.poll();
-                                        } else if (expectedSlot.userId == uidFromRedis) {
-                                            // 🎯 返回的 UID 与队头等待槽位的 UID 精确匹配！
-                                            syncWaitSlotRingBuffer.poll(); // COW 替换 ZERO_SLOT，原子清空槽位
-                                            expectedSlot.status = (allowedFlag == 1) ? 1 : 2;
+                                        } else if (expectedCtx.userId == uidFromRedis) {
+                                            // 🎯 返回的 UID 与队头等待上下文的 UID 精确匹配！
+                                            syncWaitSlotRingBuffer.poll(); // COW 替换 ZERO_CONTEXT，原子清空槽位
 
                                             // 🎯 原生响应式异步模式 (0-GC 调度回原 HTTP EventLoop)
-                                            if (expectedSlot.asyncCtx != null) {
-                                                AsyncRateLimitContext asyncCtx = expectedSlot.asyncCtx;
-                                                expectedSlot.asyncCtx = null; // 解绑引用切断物理内存泄露
-                                                if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_RESOLVED)) {
-                                                    if (asyncCtx.timeoutHandle != null) {
-                                                        asyncCtx.timeoutHandle.cancel();
-                                                    }
-                                                    // 调度回原 HTTP Channel 的 EventLoop 线程执行！
-                                                    asyncCtx.httpCtx.executor().execute(() -> {
-                                                        try {
-                                                            asyncCtx.callback.onResult(allowedFlag == 1);
-                                                        } finally {
-                                                            asyncCtx.recycle();
-                                                        }
-                                                    });
+                                            if (expectedCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_RESOLVED)) {
+                                                if (expectedCtx.timeoutHandle != null) {
+                                                    expectedCtx.timeoutHandle.cancel();
                                                 }
+                                                // 调度回原 HTTP Channel 的 EventLoop 线程执行！
+                                                expectedCtx.httpCtx.executor().execute(() -> {
+                                                    try {
+                                                        expectedCtx.callback.onResult(allowedFlag == 1);
+                                                    } finally {
+                                                        expectedCtx.recycle();
+                                                    }
+                                                });
                                             }
                                         }
                                     }
@@ -246,7 +241,7 @@ public class UserRateLimiterOperate {
     }
 
     // =========================================================================================
-    // 🚀 0-GC 同步校验基础设施: 无 GC 数组预分配 RingBuffer (0 堆内存分配、0 Node 开销)
+    // 🚀 0-GC 响应式校验基础设施: 无 GC 预分配 RingBuffer (0 堆内存分配、0 Node 开销)
     // =========================================================================================
     private final SyncWaitSlotRingBuffer syncWaitSlotRingBuffer = new SyncWaitSlotRingBuffer(1024);
 
@@ -256,7 +251,7 @@ public class UserRateLimiterOperate {
      *
      * 核心优势：
      * 1. 0 线程阻塞：绝不调用 LockSupport.park，当前 EventLoop 线程立即释放；
-     * 2. 0 堆内存分配：基于 Recycler 池化的 AsyncRateLimitContext 传递上下文；
+     * 2. 0 堆内存分配：基于 Recycler 池化的 AsyncRateLimitContext 直接入队 RingBuffer，无二层封装；
      * 3. 50ms HashedWheelTimer 超时熔断与防孤儿泄漏；
      * 4. Redis 响应后通过 asyncCtx.httpCtx.executor().execute() 精准调度回原 HTTP EventLoop。
      */
@@ -283,15 +278,9 @@ public class UserRateLimiterOperate {
             });
         }, 50, TimeUnit.MILLISECONDS);
 
-        // 2. 从 FTL 借用独占 Slot，统一放入 SyncWaitSlotRingBuffer (0-GC 统一等待环)
-        SyncWaitSlotRingBuffer.SyncWaitSlot slot = SyncWaitSlotRingBuffer.THREAD_SLOT.get();
-        slot.userId = asyncCtx.userId;
-        slot.asyncCtx = asyncCtx;
-        slot.status = 0;
-
-        // 3. 统一提交到 Redis EventLoop 串行入队并发送 TCP 字节流
+        // 2. 统一提交到 Redis EventLoop 串行入队并发送 TCP 字节流 (直接入队 AsyncRateLimitContext，0 二层包装)
         redisChannel.eventLoop().execute(() -> {
-            boolean offered = syncWaitSlotRingBuffer.offer(slot);
+            boolean offered = syncWaitSlotRingBuffer.offer(asyncCtx);
             if (offered) {
                 ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(256);
                 try {

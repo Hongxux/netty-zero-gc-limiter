@@ -32,6 +32,7 @@ public class AsyncRateLimitContext {
     public RateLimitCallback callback;
     public Timeout timeoutHandle;
     public long userId;
+    public int index;
 
     public final AtomicInteger state = new AtomicInteger(STATE_INIT);
 
@@ -42,7 +43,7 @@ public class AsyncRateLimitContext {
         }
     };
 
-    private AsyncRateLimitContext(Recycler.Handle<AsyncRateLimitContext> recyclerHandle) {
+    AsyncRateLimitContext(Recycler.Handle<AsyncRateLimitContext> recyclerHandle) {
         this.recyclerHandle = recyclerHandle;
     }
 
