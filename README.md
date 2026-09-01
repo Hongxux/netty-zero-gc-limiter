@@ -610,7 +610,39 @@ flowchart TD
 
 ### 五、 0-GC 响应式无阻塞续体与 TCP 物理反压架构 (Reactive Continuation & Backpressure Engine)
 
-当限流切入 Mode B 临界校验时，网关全面运行在 **基于 Netty `autoRead(false)` 4 层物理反压 + `Recycler` 0-GC 异步上下文 + `SyncWaitSlotRingBuffer` 硬件级无锁环形队列 + JMM 严格有序 Release-Acquire 内存屏障 + 跨 EventLoop 线程安全调度 + `HashedWheelTimer` 50ms 超时熔断** 的纯粹原生响应式架构下，实现单机 0 线程阻塞。
+#### 0. 为什么需要自研 0-GC Reactive 范式？（Project Reactor 的 GC 困境 vs 本项目解法）
+
+根据 **《响应式宣言》（The Reactive Manifesto）**，响应式架构的核心在于四大支柱：**即时响应性 (Responsive)、韧性 (Resilient)、弹性与反压 (Elastic & Backpressure)、消息驱动 (Message-Driven)**。
+
+在传统 Java 响应式技术栈（如 Spring WebFlux / Project Reactor / RxJava）中，构建一条响应式流水线（如 `Mono.just().flatMap().subscribe()`）虽然实现了线程的非阻塞切换，但在 **微基准内存分配（Alloc Profiling）** 下暴露出致命缺陷：
+* **海量中间装饰器对象（Heap Pollution）**：每个 HTTP 请求会动态实例化 8 ~ 15 个操作符对象（`MonoFlatMap`, `FluxMapFuseable`, `Operators$MonoSubscriber`, `MonoSink` 等），在高频百万 QPS 下每秒产生几百兆垃圾对象，直接摧毁了 0-GC 目标；
+* **应用层虚拟反压的局限性**：Reactor 的反压（`request(n)`）仅停留在 JVM 堆内存内部，若客户端持续通过 Socket 灌入报文，Netty 依然会源源不断把字节读入堆内存，最终引发内存溢出（OOM）。
+
+**本项目彻底摒弃了上层沉重的响应式抽象，在 Netty Socket 裸字节流与 JMM 硬件内存层，纯手工系统性实现了 100% 0-GC 的原生响应式范式：**
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                 0-GC 原生响应式架构 四大支柱映射矩阵                                     │
+├───────────────────────┬────────────────────────────────────────────┬───────────────────────────────────┤
+│ 响应式宣言核心支柱    │ 传统 Project Reactor / WebFlux 实现方式    │ 本项目 Netty 0-GC 原生架构实现     │
+├───────────────────────┼────────────────────────────────────────────┼───────────────────────────────────┤
+│ 1. 消息驱动 (Message) │ Mono/Flux 事件流 + Lambda 回调链 (多堆对象)│ 续体机制 (Suspend & Resume) + 0-GC│
+│                       │                                            │ Recycler 池化上下文 (0 堆分配)    │
+├───────────────────────┼────────────────────────────────────────────┼───────────────────────────────────┤
+│ 2. 弹性反压 (Elastic) │ JVM 堆内 request(n) 队列流控 (无法遏制TCP) │ Linux 内核 4 层物理级 TCP 零窗口  │
+│                       │                                            │ autoRead(false) 物理刹车          │
+├───────────────────────┼────────────────────────────────────────────┼───────────────────────────────────┤
+│ 3. 即时响应 (Response)│ EventLoop 线程调度 (受 GC STW 停顿干扰)     │ 0 线程阻塞 (无 park/wait) + 0-STW │
+│                       │                                            │ 硬件 L1 Cache 亲和性保障          │
+├───────────────────────┼────────────────────────────────────────────┼───────────────────────────────────┤
+│ 4. 韧性容错 (Resilient)│ Mono.timeout() / retry() 包装对象           │ 状态机 CAS 原子互斥 + 50ms 时间轮 │
+│                       │                                            │ HashedWheelTimer + 溢出快速失败   │
+└───────────────────────┴────────────────────────────────────────────┴───────────────────────────────────┘
+```
+
+---
+
+#### 1. 响应式范式的核心实现机制全景拆解
 
 ```
 网关 EventLoop 线程 (Http-EL)                           Netty Redis EventLoop 线程 (Redis-EL)
@@ -633,36 +665,29 @@ flowchart TD
 └──────────────────────────────────────────┘             └──────────────────────────────────────────────┘
 ```
 
-#### 1. Netty `autoRead(false)` 4 层物理级 TCP 反压 (TCP Zero-Window Backpressure)
-在全异步非阻塞网关中，如果不暂停读取，客户端连续发送的后续请求会并发穿透并在网关内存中大量积压，导致内存雪崩与 OOM。
-本项目通过 `channel.config().setAutoRead(false)` 触发链式反应：
-1. **网关应用层**：从 Netty Selector 中摘除 `OP_READ` 事件，停止从 Socket 抓取数据；
-2. **网关 Linux 内核**：内核 `SO_RCVBUF` 接收缓冲区迅速被未读 TCP 报文填满；
-3. **TCP 协议层**：Linux TCP 协议栈在发送 ACK 时宣告 **`Window Size = 0`（TCP 零窗口通知）**；
-4. **客户端物理层**：客户端操作系统物理停止发包，将内存压力原路反推回客户端自身，网关自身内存始终恒定在极低水平，彻底杜绝 OOM；
-5. **解除反压**：Redis 响应返回后调用 `setAutoRead(true)`，Linux 发送 `Window Update ACK`，客户端瞬间恢复发包。
+##### 机制 ①：消息驱动与续体机制（Continuation Suspend & Resume）
+* **流水线优雅挂起 (`suspendAndAcquireReactiveRateLimit`)**：
+  当网关判定请求需要进入 Redis 临界校验时，绝对不调用 `LockSupport.park`、`CountDownLatch.await` 或任何同步阻塞方法。而是从 Netty `Recycler` 借出预分配的 `AsyncRateLimitContext`，将当前请求的全部现场（`ChannelHandlerContext`、物理 `downstreamBuf`、`userId`）封装进续体对象，并向 Redis 提交非阻塞任务，随后方法立即执行 `return;`。**当前调用栈彻底退出，当前 Netty EventLoop 线程毫不停顿，瞬间释放去处理其他数万并发连接**；
+* **响应式事件恢复 (`asyncCtx.resume(granted)`)**：
+  当 Redis 回包事件到达时（消息驱动），Redis-EL 线程原位解析出 UID 并弹出上下文，通过 `asyncCtx.httpCtx.executor().execute(...)` 调度回原始 HTTP 绑定的 EventLoop 线程，触发 `asyncCtx.resume(isAllowed)`。在回调内部根据仲裁结果调用 `fireDownstream(ctx, downstreamBuf)` 恢复下游 HTTP 编解码流水线，或调用 `rejectAndRelease(...)` 回写 403 拦截。
 
-#### 2. 对称式“挂起续体”与“恢复续体”架构 (Suspend & Resume Design)
-在 `NettyInboundSecurityHandler` 中实现了极具表现力与对称美的响应式控制流：
-* **挂起续体 (`suspendAndAcquireReactiveRateLimit`)**：
-  暂停读取并从 `Recycler` 借出上下文绑定恢复函数，调用 `userRateLimiterOperate.acquireReactiveAsync(asyncCtx)` 向 Redis 提交任务后立即 `return;`，**当前 HTTP 请求在安全防线处自然挂起，当前 Worker 线程瞬间解放**；
-* **恢复续体 (`resumeContinuation`)**：
-  Redis 仲裁完毕后触发 `asyncCtx.resume(granted)`，调度回原始 EventLoop 线程，解除 TCP 反压；若配额扣减成功则触发 `fireDownstream(ctx, downstreamBuf)` 将未解码报文重新注入下游流水线；若超限或超时则升级本地硬封禁并快速回写 403 并切断连接。
+##### 机制 ②：4 层物理级 TCP 零窗口反压（TCP Physical Backpressure）
+为了防止客户端在高并发下持续灌入请求导致网关内存膨胀，本项目将响应式反压推进到了操作系统内核与 TCP 协议层：
+1. **应用层挂起**：调用 `ctx.channel().config().setAutoRead(false)`，从 Netty Selector 移除 `OP_READ` 事件；
+2. **内核层积压**：网关操作系统的 `SO_RCVBUF`（TCP 接收缓冲区）被后续报文填满；
+3. **协议层通知**：Linux TCP 协议栈向客户端发送 ACK 报文，并在 TCP Header 中宣告 **`Window Size = 0`（TCP 零窗口物理刹车）**；
+4. **客户端挂起**：客户端操作系统协议栈物理停止发送任何数据包，将内存积压原路反推给客户端自身；
+5. **恢复流通**：Redis 响应到达并调用 `setAutoRead(true)` 后，网关发送 `Window Update` ACK，客户端瞬间恢复发包，实现软硬件一体的极致弹性。
 
-#### 3. 统一 0-GC 环形队列原生直连与 JMM 严格有序屏障 (`SyncWaitSlotRingBuffer`)
-彻底消除中间槽位包装层，由 `SyncWaitSlotRingBuffer` 原生直接管理 `AsyncRateLimitContext[]`：
-* **类继承阶梯 Cache Line 填充隔离**：通过 `Pad0 -> ConsumerFields -> Pad1 -> ProducerFields -> Pad2` 类继承链物理填充 56 字节，保证读写序列号严格隔离在不同的 64 字节 CPU 缓存行中，杜绝跨核伪共享（False Sharing）；
-* **双向 Safe Zone 局部序列号缓存**：生产者优先读取本地 `cachedNextNeededAckSequence`，总线跨核嗅探（Bus Sniffing）降低 99.99%；
-* **状态机发布门禁 (`STATE_UNPUBLISHED -> STATE_INIT`)**：
-  生产者写入数据字段后，以 `ctx.state.setRelease(STATE_INIT)` 作为终极发布门禁（Store-Store 屏障），确保对消费端 `getAcquire` 严格可见；
-* **消费端有界自旋与严格有序 Reset**：
-  消费端通过 `spinWaitForPublished` 有界自旋等待数据发布落地；`poll()` 出队时先执行 `ARRAY_VH.setRelease(array, index, null)` 清空指针切断 GC 根引用，再发布推进 Ack 序列号。
+##### 机制 ③：无锁环形队列与 JMM 严格有序发布门禁 (`SyncWaitSlotRingBuffer`)
+* **0-GC 原生直连**：环形队列直接以 `AsyncRateLimitContext[]` 为物理存储，消除一切中间包装对象；
+* **Release-Acquire 单发布门禁**：生产者填充字段后，以 `ctx.state.setRelease(STATE_INIT)`（Store-Store 屏障）作为终极发布门禁；消费端通过 `spinWaitForPublished` 有界自旋感知，确保多字段在弱内存模型 CPU 上的绝对可见性；
+* **有序 Reset 与 GC 根断开**：消费端出队时，严格先执行 `ARRAY_VH.setRelease(array, index, null)` 切断 GC 根引用，再推进消费序列号，彻底杜绝对象悬挂与内存泄漏。
 
-#### 4. 异常安全闭环与 Fail-Fast 两级容错
-* **`resume(boolean isAllowed)` / `resumeWith(boolean isAllowed)`**：内置 `try-finally` 块，确保无论业务回调抛出何种异常，`recycle()` 与引用置空必定执行，彻底切断内存泄漏；
-* **两级快速失败保护**：
-  1. **队列溢出快速失败**：当 1024 槽位打满（`!offered`）时，立即取消定时器并向客户端快速返回拒绝，绝不傻等 50ms 超时；
-  2. **网络发送异常快速失败**：发送异常时通过 `RingBuffer.cancel(ctx)` 原子脱钩，并触发微秒级快速拦截。
+##### 机制 ④：全链路韧性与两级 Fail-Fast 容错（Resilience & Fault Tolerance）
+* **`try-finally` 异常安全闭环**：`asyncCtx.resume(...)` 内部使用 `try-finally { this.recycle(); }` 保证无论业务逻辑或下游抛出何种异常，上下文对象 100% 安全归还对象池；
+* **四态 CAS 防并发竞争**：`STATE_INIT -> STATE_RESOLVED / STATE_TIMEOUT / STATE_CANCELLED`，确保 Redis 回包与 50ms 时间轮超时并发到达时绝对互斥，只有一个胜出；
+* **双级快速失败降级**：当 RingBuffer 1024 槽位打满（`!offered`）或 TCP 发送异常时，系统立即取消时间轮任务并执行 `resume(false)` 向客户端快速返回拒绝，绝不让请求陷入无谓的 50ms 挂起。
 
 ---
 
