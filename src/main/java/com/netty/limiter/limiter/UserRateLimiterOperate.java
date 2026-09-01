@@ -161,7 +161,7 @@ public class UserRateLimiterOperate {
                                             syncWaitSlotRingBuffer.poll(); // COW 替换 ZERO_SLOT，原子清空槽位
                                             expectedSlot.status = (allowedFlag == 1) ? 1 : 2;
 
-                                            // 🎯 分支 1: 原生响应式异步模式 (0-GC 调度回原 HTTP EventLoop)
+                                            // 🎯 原生响应式异步模式 (0-GC 调度回原 HTTP EventLoop)
                                             if (expectedSlot.asyncCtx != null) {
                                                 AsyncRateLimitContext asyncCtx = expectedSlot.asyncCtx;
                                                 expectedSlot.asyncCtx = null; // 解绑引用切断物理内存泄露
@@ -178,12 +178,6 @@ public class UserRateLimiterOperate {
                                                         }
                                                     });
                                                 }
-                                            }
-                                            // 🎯 分支 2: 兼容同步阻塞模式 (unpark 唤醒 Worker 线程)
-                                            else if (expectedSlot.waiterThread != null) {
-                                                Thread targetThread = expectedSlot.waiterThread;
-                                                expectedSlot.waiterThread = null;
-                                                java.util.concurrent.locks.LockSupport.unpark(targetThread);
                                             }
                                         }
                                     }
@@ -293,7 +287,6 @@ public class UserRateLimiterOperate {
         SyncWaitSlotRingBuffer.SyncWaitSlot slot = SyncWaitSlotRingBuffer.THREAD_SLOT.get();
         slot.userId = asyncCtx.userId;
         slot.asyncCtx = asyncCtx;
-        slot.waiterThread = null;
         slot.status = 0;
 
         // 3. 统一提交到 Redis EventLoop 串行入队并发送 TCP 字节流
@@ -315,70 +308,6 @@ public class UserRateLimiterOperate {
 
     public void acquire0GcUidAsync(AsyncRateLimitContext asyncCtx) {
         acquire0GcUidAsync(asyncCtx, luaShaBytes);
-    }
-
-    /**
-     * 🚀 模式 B (0-GC 同步上报放行校验): 针对 80% 水位预警 (-2L) UID 执行 RESP2 0-GC 同步 EVALSHA 扣减
-     * 100% 零 GC 堆内存分配，无 Node 垃圾回收负担。
-     */
-    public boolean acquire0GcUidSync(long userId, byte[] luaShaBytes) {
-        if (redisChannel == null || !redisChannel.isActive()) {
-            // 🛡️ Fail-Closed / Connection Dead 降级保护
-            return false;
-        }
-
-        Thread currentThread = Thread.currentThread();
-        SyncWaitSlotRingBuffer.SyncWaitSlot slot = SyncWaitSlotRingBuffer.THREAD_SLOT.get();
-        slot.userId = userId;
-        slot.waiterThread = currentThread;
-        slot.asyncCtx = null; // 同步模式清空 asyncCtx
-        slot.status = 0;
-
-        // 🎯 核心并发安全修正 (100% 绝对 FIFO 保障)：
-        // 将 offer() 槽位排队与 RESP2 TCP 字节流发送统一提交至 Netty Channel 的 EventLoop 中顺序执行！
-        // 彻底杜绝多生产者线程下 offer() 序列号分配与 TCP writeAndFlush() 顺序倒置/交叉的并发隐患。
-        // 确保：EventLoop 任务队列顺序 == RingBuffer 序列号顺序 == TCP Socket 发送顺序 == Redis RESP2 响应顺序！
-        redisChannel.eventLoop().execute(() -> {
-            boolean offered = syncWaitSlotRingBuffer.offer(slot);
-            if (offered) {
-                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(256);
-                try {
-                    encodeResp2EvalSha(buf, luaShaBytes, userId,
-                            System.currentTimeMillis(), maxTokens(), refillRate(), ttlSeconds(), 1);
-                    redisChannel.writeAndFlush(buf);
-                } catch (Exception e) {
-                    buf.release();
-                    log.error("Error encoding/sending 0-GC sync EVALSHA command for userId: {}", userId, e);
-                }
-            }
-        });
-
-        // ③ 同步阻塞等待 Netty ChannelRead 唤醒 (50ms 超时 + 虚假唤醒防护)
-        // 🛡️ 虚假唤醒防护：用 deadline while 循环包裹 parkNanos 是 Java 并发标准惯用法。
-        long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(50);
-        while (slot.status == 0) {
-            long remaining = deadlineNs - System.nanoTime();
-            if (remaining <= 0) {
-                break; // 真正超时退出
-            }
-            java.util.concurrent.locks.LockSupport.parkNanos(remaining);
-            // 若因 stale permit 立即返回：status 仍为 0，deadline 未到，继续自旋等待真实唤醒
-        }
-
-        // status plain 读：HB 由 unpark → park Happens-Before 链保证
-        int result = slot.status;
-        if (result == 0) {
-            // 🛡️ 超时处理：以 CAS 将 array[index] 中的 slot 原子替换为 CANCELLED_SLOT 哨兵
-            boolean cancelled = syncWaitSlotRingBuffer.cancel(slot);
-            if (!cancelled) {
-                // CAS 失败说明 EventLoop 恰好在超时一瞬间处理完并 poll() 了该 Slot，重新读取 status 避免误判
-                result = slot.status;
-            }
-        }
-        if (result == 0) {
-            return false; // 🛡️ Fail-Open 超时降级拦截
-        }
-        return result == 1;
     }
 
     /**
