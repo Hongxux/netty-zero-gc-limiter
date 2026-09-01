@@ -217,7 +217,7 @@ flowchart TD
 
 | 物理域 | 数据成员 | 并发访问特征 (Access Patterns) | 读写时机与行为 (Timing & Behavior) | 布局决策与硬件微架构收益 |
 | :--- | :--- | :--- | :--- | :--- |
-| **探查域**<br>`keyPrefixes[]` | `key` (64-bit Hash)<br>`sigPrefix` (8B 前缀) | **同时、成对、只读、高频探查**<br>(High Temporal & Spatial Locality) | 1. **强绑定访问**：读线程在开放寻址扫描时，只要探查槽位 `i`，比对 Key 后**紧接着必然立即比对 Prefix** 进行二重防碰撞校验；<br>2. **静态只读**：槽位写入生效后，Key 与 Prefix 在整个生命周期内**只读不写** (Read-Only)。 | **允许且必须交错 (2-Long Interleaved)**：<br>打包为 16 字节，单个 64B L1 Cache Line 完美紧凑容纳 **4 组连续探查键**。哈希冲突线性步进时 100% 命中于同一条缓存行，无跨行 Cache Miss，硬件预取器 (Prefetcher) 吞吐翻倍。 |
+| **探查域**<br>`keyPrefixes[]` | `key` (64-bit Hash)<br>`sigPrefix` (8B 前缀) | **同时、成对**<br>(High Temporal & Spatial Locality) | 1. **强绑定访问**：读线程在开放寻址扫描时，只要探查槽位 `i`，比对 Key 后**紧接着必然立即比对 Prefix** 进行二重防碰撞校验；<br>2. **静态只读**：槽位写入生效后，Key 与 Prefix 在整个生命周期内**只读不写** (Read-Only)。 | **允许且必须交错 (2-Long Interleaved)**：<br>打包为 16 字节，单个 64B L1 Cache Line 完美紧凑容纳 **4 组连续探查键**。哈希冲突线性步进时 100% 命中于同一条缓存行，无跨行 Cache Miss，硬件预取器 (Prefetcher) 吞吐翻倍。 |
 | **数据域**<br>`valExps[]` | `packed(UID, ExpSec)`<br>(64-bit 打包数据) | **延迟访问、读写不对称、高频覆写**<br>(Delayed Read & Read-Write Asymmetry) | 1. **读路径延迟访问 (Delayed Access)**：只有当 Key 与 Prefix **全部匹配成功后才会去读取 1 次 Value**；探查失败的槽位若载入 Value 纯属浪费缓存带宽；<br>2. **写路径动态覆写**：写线程更新 Value、刷新过期时间或冷热晋升时存在**高频并发写覆写**。 | **绝对禁止交错，必须物理隔离 (Isolated Array)**：<br>若交错塞入同一缓存行，写线程更新 Value 会触发 CPU 的 MESI 缓存一致性协议，发出 **RFO (Request For Ownership) 信号广播使整行失效**，将其他核心上读线程正在探查 Key 的 L1 Cache 行清空，引发**毁灭性伪共享 (False Sharing)** 与总线停顿。 |
 
 * **探查密度极值化（拒绝缓存污染 Cache Pollution）**：
