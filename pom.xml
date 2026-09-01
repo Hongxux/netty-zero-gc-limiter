@@ -8,7 +8,14 @@
     <artifactId>netty-zero-gc-limiter-starter</artifactId>
     <version>1.0.0-SNAPSHOT</version>
     <name>netty-zero-gc-limiter-starter</name>
-    <description>Zero-GC High Performance Netty Inbound Rate Limiter &amp; Security Starter</description>
+    <description>基于 Netty 与 Java 21 原生引擎的 0-GC 极前置高性能安全网关与无锁限流组件 (Zero-GC High Performance Netty Inbound Rate Limiter &amp; Security Starter)</description>
+    <url>https://github.com/Hongxux/netty-zero-gc-limiter</url>
+
+    <scm>
+        <connection>scm:git:git://github.com/Hongxux/netty-zero-gc-limiter.git</connection>
+        <developerConnection>scm:git:ssh://github.com:Hongxux/netty-zero-gc-limiter.git</developerConnection>
+        <url>https://github.com/Hongxux/netty-zero-gc-limiter</url>
+    </scm>
 
     <properties>
         <java.version>21</java.version>

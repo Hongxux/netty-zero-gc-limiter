@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # ==============================================================================
+  # Redis 7.2 (分布式限流令牌桶、EVALSHA 脚本、80% 水位 Pub/Sub 广播通道)
+  # ==============================================================================
+  redis:
+    image: redis:7.2-alpine
+    container_name: netty-limiter-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ==============================================================================
+  # MySQL 8.0 (持久化黑白名单、租户配额、安全审计规则)
+  # ==============================================================================
+  mysql:
+    image: mysql:8.0.36
+    container_name: netty-limiter-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: gateway_limiter_db
+    ports:
+      - "3306:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==============================================================================
+  # RabbitMQ 3.12 (异步持久化安全风控审计日志与封禁告警)
+  # ==============================================================================
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: netty-limiter-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
