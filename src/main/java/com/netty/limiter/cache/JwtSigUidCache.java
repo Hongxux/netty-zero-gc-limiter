@@ -41,6 +41,10 @@ public enum JwtSigUidCache {
     public static final long EMPTY = 0L;
     public static final long TOMBSTONE = -1L;
 
+    public static boolean isLive(long key) {
+        return key != EMPTY && key != TOMBSTONE;
+    }
+
     public static long packValExp(long uid, long expSec) {
         return ((uid & 0xFFFFFFFFL) << 32) | (expSec & 0xFFFFFFFFL);
     }
@@ -331,7 +335,7 @@ public enum JwtSigUidCache {
                 return;
             }
 
-            if (k == EMPTY || k == TOMBSTONE) {
+            if (!isLive(k)) {
                 if (h.casKey(idx, k, key)) {
                     h.setPrefixRelease(idx, sigPrefix);
                     h.setValExpRelease(idx, packed);
