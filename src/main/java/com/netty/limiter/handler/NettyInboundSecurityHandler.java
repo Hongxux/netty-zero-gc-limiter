@@ -94,7 +94,7 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
                     return; // 立即返回挂起当前 Pipeline，等待异步唤醒回调继续执行！
                 } else {
                     // 🚀 普通未预警 UID：执行【异步非阻塞上报版本】(Async Offloading + Pipeline 攒批)
-                    userRateLimiterOperate.acquire0GcUidBatch(userId, com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
+                    userRateLimiterOperate.acquireBatchOffload(userId, com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
                 }
             }
 
@@ -125,7 +125,7 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
                         (granted) -> resumeContinuation(ctx, downstreamBuf, userId, granted));
 
         // 3. 异步提交给 Redis 驱动，当前线程立即返回
-        userRateLimiterOperate.acquire0GcUidAsync(asyncCtx);
+        userRateLimiterOperate.acquireReactiveAsync(asyncCtx);
     }
 
     /**

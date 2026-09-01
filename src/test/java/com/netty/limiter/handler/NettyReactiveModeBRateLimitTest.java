@@ -104,7 +104,7 @@ public class NettyReactiveModeBRateLimitTest {
         channel.writeInbound(buf);
 
         // 验证 Mode B 触发了异步分派
-        verify(userRateLimiterOperate, times(1)).acquire0GcUidAsync(captor.capture());
+        verify(userRateLimiterOperate, times(1)).acquireReactiveAsync(captor.capture());
 
         AsyncRateLimitContext capturedCtx = captor.getValue();
         assertNotNull(capturedCtx);
@@ -142,7 +142,7 @@ public class NettyReactiveModeBRateLimitTest {
         ByteBuf buf = Unpooled.copiedBuffer(httpRequest, StandardCharsets.UTF_8);
         channel.writeInbound(buf);
 
-        verify(userRateLimiterOperate, times(1)).acquire0GcUidAsync(captor.capture());
+        verify(userRateLimiterOperate, times(1)).acquireReactiveAsync(captor.capture());
         AsyncRateLimitContext capturedCtx = captor.getValue();
 
         // 模拟 Redis 异步回包：拒绝 (granted = false)

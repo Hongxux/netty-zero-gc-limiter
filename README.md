@@ -628,7 +628,8 @@ flowchart TD
 │ 5. 恢复续体：resumeContinuation          │ ◄─ execute ─┤ 6. httpCtx.executor() 调度回原 Http-EL       │
 │    - 解除反压: setAutoRead(true) 恢复读取│             │                                              │
 │    - 放行 fireDownstream / 拦截 403      │             │                                              │
-│ 6. completeAndRecycle 归还对象池 (0-GC)  │             │                                              │
+│ 6. asyncCtx.resume(granted) 恢复续体并   │             │                                              │
+│    安全归还对象池 (100% 0-GC 闭环)       │             │                                              │
 └──────────────────────────────────────────┘             └──────────────────────────────────────────────┘
 ```
 
@@ -644,9 +645,9 @@ flowchart TD
 #### 2. 对称式“挂起续体”与“恢复续体”架构 (Suspend & Resume Design)
 在 `NettyInboundSecurityHandler` 中实现了极具表现力与对称美的响应式控制流：
 * **挂起续体 (`suspendAndAcquireReactiveRateLimit`)**：
-  暂停读取并从 `Recycler` 借出上下文绑定恢复函数，向 Redis 提交任务后立即 `return;`，**当前 HTTP 请求在安全防线处自然挂起，当前 Worker 线程瞬间解放**；
+  暂停读取并从 `Recycler` 借出上下文绑定恢复函数，调用 `userRateLimiterOperate.acquireReactiveAsync(asyncCtx)` 向 Redis 提交任务后立即 `return;`，**当前 HTTP 请求在安全防线处自然挂起，当前 Worker 线程瞬间解放**；
 * **恢复续体 (`resumeContinuation`)**：
-  Redis 仲裁完毕后，调度回原始 EventLoop 线程，解除 TCP 反压；若配额扣减成功则触发 `fireDownstream(ctx, downstreamBuf)` 将未解码报文重新注入下游流水线；若超限或超时则升级本地硬封禁并快速回写 403 并切断连接。
+  Redis 仲裁完毕后触发 `asyncCtx.resume(granted)`，调度回原始 EventLoop 线程，解除 TCP 反压；若配额扣减成功则触发 `fireDownstream(ctx, downstreamBuf)` 将未解码报文重新注入下游流水线；若超限或超时则升级本地硬封禁并快速回写 403 并切断连接。
 
 #### 3. 统一 0-GC 环形队列原生直连与 JMM 严格有序屏障 (`SyncWaitSlotRingBuffer`)
 彻底消除中间槽位包装层，由 `SyncWaitSlotRingBuffer` 原生直接管理 `AsyncRateLimitContext[]`：
@@ -658,7 +659,7 @@ flowchart TD
   消费端通过 `spinWaitForPublished` 有界自旋等待数据发布落地；`poll()` 出队时先执行 `ARRAY_VH.setRelease(array, index, null)` 清空指针切断 GC 根引用，再发布推进 Ack 序列号。
 
 #### 4. 异常安全闭环与 Fail-Fast 两级容错
-* **`completeAndRecycle(boolean isAllowed)`**：内置 `try-finally` 块，确保无论业务回调抛出何种异常，`recycle()` 与引用置空必定执行，彻底切断内存泄漏；
+* **`resume(boolean isAllowed)` / `resumeWith(boolean isAllowed)`**：内置 `try-finally` 块，确保无论业务回调抛出何种异常，`recycle()` 与引用置空必定执行，彻底切断内存泄漏；
 * **两级快速失败保护**：
   1. **队列溢出快速失败**：当 1024 槽位打满（`!offered`）时，立即取消定时器并向客户端快速返回拒绝，绝不傻等 50ms 超时；
   2. **网络发送异常快速失败**：发送异常时通过 `RingBuffer.cancel(ctx)` 原子脱钩，并触发微秒级快速拦截。

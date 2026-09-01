@@ -119,7 +119,7 @@ class RedisLimiterComparisonBenchmarkTest {
             final int thread = t;
             pool.submit(() -> {
                 for (int i = 0; i < OPS_PER_THREAD; i++) {
-                    operate.acquire0GcUidBatch((long) thread * OPS_PER_THREAD + i, LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
+                    operate.acquireBatchOffload((long) thread * OPS_PER_THREAD + i, LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
                 }
                 operate.flushThreadBatch(LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
                 done.countDown();

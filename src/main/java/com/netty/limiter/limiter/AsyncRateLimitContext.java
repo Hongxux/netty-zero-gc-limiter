@@ -67,9 +67,12 @@ public class AsyncRateLimitContext {
     }
 
     /**
-     * 执行回调通知并 0-GC 归还对象池 (带 try-finally 异常安全保障)
+     * 🎯 恢复续体执行并 0-GC 归还对象池 (带 try-finally 异常安全保障)
+     *
+     * 1. 触发注册的续体回调 (resumeContinuation)，通知下游流水线恢复；
+     * 2. 无论业务逻辑是否发生异常，在 finally 块中自动归还 Recycler 对象池。
      */
-    public void completeAndRecycle(boolean isAllowed) {
+    public void resume(boolean isAllowed) {
         try {
             if (this.callback != null) {
                 this.callback.onResult(isAllowed);
@@ -77,6 +80,13 @@ public class AsyncRateLimitContext {
         } finally {
             this.recycle();
         }
+    }
+
+    /**
+     * 响应式续体恢复别名方法 (Continuation.resumeWith)
+     */
+    public void resumeWith(boolean isAllowed) {
+        resume(isAllowed);
     }
 
     /**

@@ -62,7 +62,7 @@ public class UserRateLimiterRealRedisBenchmarkTest {
 
             // 预热 JIT
             for (int i = 0; i < 50000; i++) {
-                operate.acquire0GcUidBatch(10086L + i, luaShaBytes);
+                operate.acquireBatchOffload(10086L + i, luaShaBytes);
             }
             operate.flushThreadBatch(luaShaBytes);
 
@@ -74,7 +74,7 @@ public class UserRateLimiterRealRedisBenchmarkTest {
                 final long baseUid = (long) t * opsPerThread;
                 pool2.submit(() -> {
                     for (int i = 0; i < opsPerThread; i++) {
-                        operate.acquire0GcUidBatch(baseUid + i, luaShaBytes);
+                        operate.acquireBatchOffload(baseUid + i, luaShaBytes);
                     }
                     operate.flushThreadBatch(luaShaBytes);
                     latch2.countDown();

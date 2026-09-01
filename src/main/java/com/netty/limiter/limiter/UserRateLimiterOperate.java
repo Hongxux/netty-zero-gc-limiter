@@ -166,7 +166,7 @@ public class UserRateLimiterOperate {
                                                     expectedCtx.timeoutHandle.cancel();
                                                 }
                                                 // 调度回原 HTTP Channel 的 EventLoop 线程执行！
-                                                expectedCtx.httpCtx.executor().execute(() -> expectedCtx.completeAndRecycle(allowedFlag == 1));
+                                                expectedCtx.httpCtx.executor().execute(() -> expectedCtx.resume(allowedFlag == 1));
                                             }
                                         }
                                     }
@@ -247,14 +247,14 @@ public class UserRateLimiterOperate {
      * 1. 0 线程阻塞：绝不调用 LockSupport.park，当前 EventLoop 线程立即释放；
      * 2. 0 堆内存分配：基于 Recycler 池化的 AsyncRateLimitContext 直接入队 RingBuffer，无二层封装；
      * 3. 50ms HashedWheelTimer 超时熔断与防孤儿泄漏；
-     * 4. Redis 响应后通过 asyncCtx.httpCtx.executor().execute() 精准调度回原 HTTP EventLoop。
+     * 4. Redis 响应后通过 asyncCtx.httpCtx.executor().execute() 精准调度回原 HTTP EventLoop 触发 asyncCtx.resume()。
      */
-    public void acquire0GcUidAsync(AsyncRateLimitContext asyncCtx, byte[] luaShaBytes) {
+    public void acquireReactiveAsync(AsyncRateLimitContext asyncCtx, byte[] luaShaBytes) {
         if (redisChannel == null || !redisChannel.isActive()) {
             // 🛡️ Fail-Closed 降级保护：连接不可用时异步拒绝
             asyncCtx.httpCtx.executor().execute(() -> {
                 if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_RESOLVED)) {
-                    asyncCtx.completeAndRecycle(false);
+                    asyncCtx.resume(false);
                 }
             });
             return;
@@ -265,7 +265,7 @@ public class UserRateLimiterOperate {
             asyncCtx.httpCtx.executor().execute(() -> {
                 if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_TIMEOUT)) {
                     // 超时快速拦截
-                    asyncCtx.completeAndRecycle(false);
+                    asyncCtx.resume(false);
                 }
             });
         }, 50, TimeUnit.MILLISECONDS);
@@ -289,7 +289,7 @@ public class UserRateLimiterOperate {
                     }
                     asyncCtx.httpCtx.executor().execute(() -> {
                         if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_CANCELLED)) {
-                            asyncCtx.completeAndRecycle(false);
+                            asyncCtx.resume(false);
                         }
                     });
                 }
@@ -301,21 +301,21 @@ public class UserRateLimiterOperate {
                 }
                 asyncCtx.httpCtx.executor().execute(() -> {
                     if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_CANCELLED)) {
-                        asyncCtx.completeAndRecycle(false);
+                        asyncCtx.resume(false);
                     }
                 });
             }
         });
     }
 
-    public void acquire0GcUidAsync(AsyncRateLimitContext asyncCtx) {
-        acquire0GcUidAsync(asyncCtx, luaShaBytes);
+    public void acquireReactiveAsync(AsyncRateLimitContext asyncCtx) {
+        acquireReactiveAsync(asyncCtx, luaShaBytes);
     }
 
     /**
      * 0-GC 直连限流入口：直接构建 RESP2 EVALSHA 命令字节流异步发送给 Redis (带 Fail-Open 降级保护)
      */
-    public void acquire0GcUid(long userId, byte[] luaShaBytes) {
+    public void acquireSingleDirect(long userId, byte[] luaShaBytes) {
         if (redisChannel == null || !redisChannel.isActive()) {
             // 🛡️ 降级保障 (Fail-Open)：连接异常空窗期内静默放行，确保网关核心 HTTP 流程不受影响
             return;
@@ -331,11 +331,15 @@ public class UserRateLimiterOperate {
         }
     }
 
+    public void acquireSingleDirect(long userId) {
+        acquireSingleDirect(userId, luaShaBytes);
+    }
+
     /**
      * 🚀 模式 A 限流入口：基于 FastThreadLocal + long[] 数组自适应攒批 RESP2 Pipeline 异步发送
      * (攒满 32 条或超时 50µs 自动打成单个 ByteBuf 批量发送，带 Fail-Open 降级保护)
      */
-    public void acquire0GcUidBatch(long userId, byte[] luaShaBytes) {
+    public void acquireBatchOffload(long userId, byte[] luaShaBytes) {
         if (redisChannel == null || !redisChannel.isActive()) {
             // 🛡️ 降级保障 (Fail-Open)：连接不可用时快速通过
             return;
@@ -349,6 +353,10 @@ public class UserRateLimiterOperate {
             batchBuffer.count = 0;
             batchBuffer.lastFlushNanos = now;
         }
+    }
+
+    public void acquireBatchOffload(long userId) {
+        acquireBatchOffload(userId, luaShaBytes);
     }
 
     /**
