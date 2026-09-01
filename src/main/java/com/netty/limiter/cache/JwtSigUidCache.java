@@ -97,9 +97,13 @@ public enum JwtSigUidCache {
             return KEY_PREFIXES_VH.compareAndSet(keyPrefixes, idx * KEY_PREFIX_STRIDE, expected, newKey);
         }
 
-        // ② Signature Prefix 读取/写入
+        // ② Signature Prefix 读取/写入 (普通写 Plain Store + 依靠 valExp 作为 Release 屏障发布)
         public long getPrefixAcquire(int idx) {
             return (long) KEY_PREFIXES_VH.getAcquire(keyPrefixes, idx * KEY_PREFIX_STRIDE + 1);
+        }
+
+        public void setPrefix(int idx, long prefix) {
+            KEY_PREFIXES_VH.set(keyPrefixes, idx * KEY_PREFIX_STRIDE + 1, prefix);
         }
 
         public void setPrefixRelease(int idx, long prefix) {
@@ -292,7 +296,7 @@ public enum JwtSigUidCache {
                     }
                     long uid = unpackUid(valExp);
                     if (c.casKey(idx, key, TOMBSTONE)) {
-                        c.setPrefixRelease(idx, 0L);
+                        c.setPrefix(idx, 0L);
                         c.setValExpRelease(idx, 0L);
                     }
                     put(sigHash, sigPrefix, uid, expSec);
@@ -330,14 +334,14 @@ public enum JwtSigUidCache {
                 // 先将 valExp 设为 0L (哨兵)，通知并发读线程数据正在更新，强制读线程自旋等待，
                 // 彻底擦除 storedPrefix 与 valExp 跨字段更新期间读取到旧 ValExp 的脏读隐患！
                 h.setValExpRelease(idx, 0L);
-                h.setPrefixRelease(idx, sigPrefix);
+                h.setPrefix(idx, sigPrefix);
                 h.setValExpRelease(idx, packed);
                 return;
             }
 
             if (!isLive(k)) {
                 if (h.casKey(idx, k, key)) {
-                    h.setPrefixRelease(idx, sigPrefix);
+                    h.setPrefix(idx, sigPrefix);
                     h.setValExpRelease(idx, packed);
                     h.count.incrementAndGet();
                     return;
@@ -369,7 +373,7 @@ public enum JwtSigUidCache {
             if (k == EMPTY) break;
             if (k == key) {
                 if (h.casKey(idx, key, TOMBSTONE)) {
-                    h.setPrefixRelease(idx, 0L);
+                    h.setPrefix(idx, 0L);
                     h.setValExpRelease(idx, 0L);
                 }
                 break;
@@ -383,7 +387,7 @@ public enum JwtSigUidCache {
             if (k == EMPTY) break;
             if (k == key) {
                 if (c.casKey(idx, key, TOMBSTONE)) {
-                    c.setPrefixRelease(idx, 0L);
+                    c.setPrefix(idx, 0L);
                     c.setValExpRelease(idx, 0L);
                 }
                 break;

@@ -333,7 +333,7 @@ flowchart TD
        - **反例推演 B（先写 ValExp 再写 Prefix）**：写线程刚写入 `UID_New`，此时并发读线程传入 `P_Old` 对应的旧 Token 查询。读线程读取到新数据 `UID_New`，随后校验 Prefix 发现 `P_Old == P_Old` 匹配成功！**结果：持旧 Token 的用户被赋予了属于新用户的 `UID_New` 身份！**
        - **0L 哨兵三步生命周期的终极防御**：
          1. **竖立哨兵 (Step 1)**：写线程执行 `setValExpRelease(idx, 0L)` 将 ValExp 置零。此时读线程一旦读取到 `0L`，便知晓数据处于更新瞬态，**绝不信任当前字段，强制进入自旋等待**；
-         2. **更新前缀 (Step 2)**：执行 `setPrefixRelease(idx, P_New)` 安全替换 8 字节前缀；
+         2. **更新前缀 (Step 2)**：执行 `setPrefix(idx, P_New)` 安全替换 8 字节前缀（普通写进入 CPU Store Buffer 进行写合并）；
          3. **撤除哨兵并原子发布 (Step 3)**：执行 `setValExpRelease(idx, packed_New)` 写入新数据，撤除 0L 哨兵。读线程自旋结束，原子感知到强一致的新版本数据。**彻底杜绝跨字段错位与身份冒领！**
   
   - **为什么竖立哨兵使用单指令 `setValExpRelease(0L)`，而无需昂贵的 CAS？**
@@ -610,46 +610,58 @@ flowchart TD
 
 ### 五、 0-GC 响应式无阻塞续体与 TCP 物理反压架构 (Reactive Continuation & Backpressure Engine)
 
-当限流切入 Mode B 同步校验时，网关全面升级为 **基于 Netty `autoRead(false)` TCP 物理反压 + `Recycler` 0-GC 异步上下文池 + 跨 EventLoop 线程安全调度 + `HashedWheelTimer` 50ms 超时熔断** 的原生响应式无阻塞架构，同时保留 `SyncWaitSlotRingBuffer` 作为同步阻塞兼容桥接器。
+当限流切入 Mode B 临界校验时，网关全面运行在 **基于 Netty `autoRead(false)` 4 层物理反压 + `Recycler` 0-GC 异步上下文 + `SyncWaitSlotRingBuffer` 硬件级无锁环形队列 + JMM 严格有序 Release-Acquire 内存屏障 + 跨 EventLoop 线程安全调度 + `HashedWheelTimer` 50ms 超时熔断** 的纯粹原生响应式架构下，实现单机 0 线程阻塞。
 
 ```
 网关 EventLoop 线程 (Http-EL)                           Netty Redis EventLoop 线程 (Redis-EL)
-┌──────────────────────────────────────┐             ┌──────────────────────────────────────────┐
-│ 1. 收到 HTTP 请求，判定切入 Mode B    │             │                                          │
-│ 2. 物理反压：setAutoRead(false) 暂停 │             │                                          │
-│ 3. 从 Recycler 借出 0-GC AsyncContext │             │                                          │
-│ 4. 提交 Redis-EL 异步 Pipeline 发送  │ ──────────► │ 1. 串行入队并发送 RESP2 EVALSHA 字节流   │
-│ 5. Http-EL 立即释放！(0 线程阻塞)     │             │ 2. Redis 返回，LineBasedFrameDecoder 收包│
-│                                      │             │ 3. 原位解析 UID 与 Status                 │
-│ 6. 恢复读取：setAutoRead(true)       │ ◄─ execute ─┤ 4. CAS 抢占状态并取消 50ms 时间轮超时任务│
-│ 7. 放行 fireDownstream / 拦截 403    │             │ 5. httpCtx.executor() 调度回原 Http-EL   │
-│ 8. 归还 Recycler (100% 0-GC)         │             │                                          │
-└──────────────────────────────────────┘             └──────────────────────────────────────────┘
+┌──────────────────────────────────────────┐             ┌──────────────────────────────────────────────┐
+│ 1. 收到 HTTP 请求，判定切入 Mode B        │             │                                              │
+│ 2. 挂起流水线：suspendAndAcquire...      │             │                                              │
+│    - 物理反压: setAutoRead(false) 暂停   │             │                                              │
+│    - 借出续体: AsyncRateLimitContext     │             │                                              │
+│ 3. 提交 Redis-EL 异步 Pipeline 环形队列  │ ──────────► │ 1. RingBuffer.offer(ctx) 串行入队            │
+│ 4. Http-EL 立即释放！(0 线程阻塞)         │             │    (以 state.setRelease 作为终极发布门禁)    │
+│                                          │             │ 2. 发送 RESP2 EVALSHA 堆外直接内存字节流      │
+│                                          │             │ 3. 3ms 后 Redis 回包，FrameDecoder 切分      │
+│                                          │             │ 4. RingBuffer.poll(ctx) 弹出上下文并有序置空  │
+│                                          │             │ 5. CAS 抢占成功并取消 50ms 时间轮超时任务    │
+│ 5. 恢复续体：resumeContinuation          │ ◄─ execute ─┤ 6. httpCtx.executor() 调度回原 Http-EL       │
+│    - 解除反压: setAutoRead(true) 恢复读取│             │                                              │
+│    - 放行 fireDownstream / 拦截 403      │             │                                              │
+│ 6. completeAndRecycle 归还对象池 (0-GC)  │             │                                              │
+└──────────────────────────────────────────┘             └──────────────────────────────────────────────┘
 ```
 
-#### 1. Netty `autoRead(false)` 4 层物理级 TCP 反压 (Backpressure)
-在全异步非阻塞网关中，如果不暂停读取，客户端连续发送的后续请求会并发穿透并导致内存雪崩。
+#### 1. Netty `autoRead(false)` 4 层物理级 TCP 反压 (TCP Zero-Window Backpressure)
+在全异步非阻塞网关中，如果不暂停读取，客户端连续发送的后续请求会并发穿透并在网关内存中大量积压，导致内存雪崩与 OOM。
 本项目通过 `channel.config().setAutoRead(false)` 触发链式反应：
-1. **网关应用层**：从 Netty Selector 中摘除 `OP_READ` 事件，停止读取 TCP 数据；
-2. **网关 Linux 内核**：内核 `SO_RCVBUF` 接收缓冲区迅速填满；
-3. **TCP 协议层**：Linux TCP 协议栈在发送 ACK 时宣告 **`Window Size = 0`（零窗口通知）**；
-4. **客户端机器**：客户端操作系统物理停止发包，将内存压力原路反推回客户端自身，网关自身内存始终恒定在极低水平，彻底杜绝 OOM。
+1. **网关应用层**：从 Netty Selector 中摘除 `OP_READ` 事件，停止从 Socket 抓取数据；
+2. **网关 Linux 内核**：内核 `SO_RCVBUF` 接收缓冲区迅速被未读 TCP 报文填满；
+3. **TCP 协议层**：Linux TCP 协议栈在发送 ACK 时宣告 **`Window Size = 0`（TCP 零窗口通知）**；
+4. **客户端物理层**：客户端操作系统物理停止发包，将内存压力原路反推回客户端自身，网关自身内存始终恒定在极低水平，彻底杜绝 OOM；
 5. **解除反压**：Redis 响应返回后调用 `setAutoRead(true)`，Linux 发送 `Window Update ACK`，客户端瞬间恢复发包。
 
-#### 2. Netty `Recycler` 0-GC 异步上下文对象池 (`AsyncRateLimitContext`)
-为了消除回调产生的堆内存垃圾与 `CompletableFuture` 对象分配，自研基于 Netty `Recycler` 的无锁对象池：
-* **四态 CAS 状态机防护**：内置 `AtomicInteger state`（`0: INIT, 1: RESOLVED, 2: TIMEOUT, 3: CANCELLED`），在 Redis 响应与 50ms 时间轮超时并发到达时提供原子互斥保障；
-* **生命周期闭环**：请求透传或拦截后立即调用 `asyncCtx.recycle()` 重置所有字段引用并归还对象池，100% 零堆内存分配。
+#### 2. 对称式“挂起续体”与“恢复续体”架构 (Suspend & Resume Design)
+在 `NettyInboundSecurityHandler` 中实现了极具表现力与对称美的响应式控制流：
+* **挂起续体 (`suspendAndAcquireReactiveRateLimit`)**：
+  暂停读取并从 `Recycler` 借出上下文绑定恢复函数，向 Redis 提交任务后立即 `return;`，**当前 HTTP 请求在安全防线处自然挂起，当前 Worker 线程瞬间解放**；
+* **恢复续体 (`resumeContinuation`)**：
+  Redis 仲裁完毕后，调度回原始 EventLoop 线程，解除 TCP 反压；若配额扣减成功则触发 `fireDownstream(ctx, downstreamBuf)` 将未解码报文重新注入下游流水线；若超限或超时则升级本地硬封禁并快速回写 403 并切断连接。
 
-#### 3. 跨 EventLoop 线程亲和性与安全调度 (Thread Affinity)
-HTTP 连接运行在 `WorkerEventLoopGroup`，而 Redis 客户端运行在 `RedisEventLoopGroup`。
-当 Redis-EL 收到响应后，**绝对不直接跨线程操作 HTTP Channel**，而是通过 `asyncCtx.httpCtx.executor().execute(...)` 将恢复与透传逻辑调度回该连接绑定的原始 EventLoop 线程执行，严格维持 Netty 单线程无锁执行模型。
-
-#### 4. 兼容性同步桥接器 (`SyncWaitSlotRingBuffer`)
-为了在兼容传统同步签名（如 Servlet Filter、阻塞 SDK）的场景下同样达成 0-GC，自研了基于 `FastThreadLocal` 预分配槽位与 Disruptor 继承阶梯缓存行隔离的无锁等待环：
-* **类继承阶梯 Cache Line 填充隔离**：通过 `Pad0 -> ConsumerFields -> Pad1 -> ProducerFields -> Pad2` 类继承链物理填充 56 字节，保证读写序列号严格隔离在不同的 64 字节 CPU 缓存行中，杜绝伪共享（False Sharing）；
+#### 3. 统一 0-GC 环形队列原生直连与 JMM 严格有序屏障 (`SyncWaitSlotRingBuffer`)
+彻底消除中间槽位包装层，由 `SyncWaitSlotRingBuffer` 原生直接管理 `AsyncRateLimitContext[]`：
+* **类继承阶梯 Cache Line 填充隔离**：通过 `Pad0 -> ConsumerFields -> Pad1 -> ProducerFields -> Pad2` 类继承链物理填充 56 字节，保证读写序列号严格隔离在不同的 64 字节 CPU 缓存行中，杜绝跨核伪共享（False Sharing）；
 * **双向 Safe Zone 局部序列号缓存**：生产者优先读取本地 `cachedNextNeededAckSequence`，总线跨核嗅探（Bus Sniffing）降低 99.99%；
-* **COW 哨兵机制 (`ZERO_SLOT` / `CANCELLED_SLOT`)**：50ms 超时时生产者原子 CAS 替换槽位脱钩，防止迟到的 Redis 响应误唤醒复用的新请求。
+* **状态机发布门禁 (`STATE_UNPUBLISHED -> STATE_INIT`)**：
+  生产者写入数据字段后，以 `ctx.state.setRelease(STATE_INIT)` 作为终极发布门禁（Store-Store 屏障），确保对消费端 `getAcquire` 严格可见；
+* **消费端有界自旋与严格有序 Reset**：
+  消费端通过 `spinWaitForPublished` 有界自旋等待数据发布落地；`poll()` 出队时先执行 `ARRAY_VH.setRelease(array, index, null)` 清空指针切断 GC 根引用，再发布推进 Ack 序列号。
+
+#### 4. 异常安全闭环与 Fail-Fast 两级容错
+* **`completeAndRecycle(boolean isAllowed)`**：内置 `try-finally` 块，确保无论业务回调抛出何种异常，`recycle()` 与引用置空必定执行，彻底切断内存泄漏；
+* **两级快速失败保护**：
+  1. **队列溢出快速失败**：当 1024 槽位打满（`!offered`）时，立即取消定时器并向客户端快速返回拒绝，绝不傻等 50ms 超时；
+  2. **网络发送异常快速失败**：发送异常时通过 `RingBuffer.cancel(ctx)` 原子脱钩，并触发微秒级快速拦截。
 
 ---
 

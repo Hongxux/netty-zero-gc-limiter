@@ -90,25 +90,8 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
                     return;
                 } else if (userBanStatus == LocalBanCache.BAN_STATUS_WARNED_SYNC_REQUIRED) {
                     // 🚨 80% 水位降级预警 (ExpSec == -2L)：执行【0-GC 响应式异步无阻塞校验 + TCP 物理反压】
-                    // 1. 物理反压：暂停当前 TCP Socket 读取，通过 TCP 零窗口将内存压力反推给客户端
-                    ctx.channel().config().setAutoRead(false);
-
-                    // 2. 从对象池借出 0-GC 异步上下文
-                    com.netty.limiter.limiter.AsyncRateLimitContext asyncCtx =
-                            com.netty.limiter.limiter.AsyncRateLimitContext.acquire(ctx, downstreamBuf, userId, (granted) -> {
-                                // 3. 恢复 TCP Socket 自动读取
-                                ctx.channel().config().setAutoRead(true);
-                                if (!granted) {
-                                    localBanCache.putUserBan(userId, 60); // 升级为硬封禁
-                                    rejectAndRelease(ctx, downstreamBuf, 403, SecurityResponses.RESPONSE_403, RateLimitReasonCodes.REASON_LOCAL_BAN);
-                                } else {
-                                    fireDownstream(ctx, downstreamBuf);
-                                }
-                            });
-
-                    // 4. 异步发射 Redis EVALSHA 扣减请求，当前 EventLoop 线程立即释放！
-                    userRateLimiterOperate.acquire0GcUidAsync(asyncCtx);
-                    return; // 立即返回，等待异步唤醒回调继续执行！
+                    suspendAndAcquireReactiveRateLimit(ctx, downstreamBuf, userId);
+                    return; // 立即返回挂起当前 Pipeline，等待异步唤醒回调继续执行！
                 } else {
                     // 🚀 普通未预警 UID：执行【异步非阻塞上报版本】(Async Offloading + Pipeline 攒批)
                     userRateLimiterOperate.acquire0GcUidBatch(userId, com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
@@ -120,6 +103,48 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
         } catch (Throwable t) {
             downstreamBuf.release();
             throw t;
+        }
+    }
+
+    /**
+     * 🚀 核心架构：挂起当前 Pipeline 并进入【0-GC 响应式异步无阻塞校验 + TCP 物理反压】
+     *
+     * 机制拆解：
+     * 1. 物理反压 (TCP Backpressure): 暂停当前 TCP Socket 读取，通过 TCP 零窗口将内存压力反推给客户端；
+     * 2. 借出续体上下文 (Continuation Context): 从 Recycler 借出 0-GC 异步上下文保存 httpCtx、downstreamBuf 与 userId；
+     * 3. 绑定续体恢复函数 (resumeContinuation): Redis 仲裁完毕后恢复 autoRead(true) 并裁决流水线走向；
+     * 4. 异步发射 EVALSHA: 将上下文排入 RingBuffer 发送给 Redis，当前 EventLoop 线程立即解放。
+     */
+    private void suspendAndAcquireReactiveRateLimit(ChannelHandlerContext ctx, ByteBuf downstreamBuf, long userId) {
+        // 1. 物理反压：暂停当前 TCP Socket 读取
+        ctx.channel().config().setAutoRead(false);
+
+        // 2. 从对象池借出 0-GC 异步上下文，绑定续体恢复函数
+        com.netty.limiter.limiter.AsyncRateLimitContext asyncCtx =
+                com.netty.limiter.limiter.AsyncRateLimitContext.acquire(ctx, downstreamBuf, userId,
+                        (granted) -> resumeContinuation(ctx, downstreamBuf, userId, granted));
+
+        // 3. 异步提交给 Redis 驱动，当前线程立即返回
+        userRateLimiterOperate.acquire0GcUidAsync(asyncCtx);
+    }
+
+    /**
+     * 🎯 续体恢复与结果裁决 (Resume Pipeline Continuation):
+     * 1. 解除 TCP 物理反压 (setAutoRead(true))；
+     * 2. 若 Redis 仲裁放行：触发 fireDownstream 恢复下游 Pipeline 流水线；
+     * 3. 若 Redis 仲裁拒绝/超时：升级本地硬封禁缓存，并回写 403 响应切断连接。
+     */
+    private void resumeContinuation(ChannelHandlerContext ctx, ByteBuf downstreamBuf, long userId, boolean isAllowed) {
+        // 1. 恢复 TCP Socket 自动读取 (解除物理反压)
+        ctx.channel().config().setAutoRead(true);
+
+        if (isAllowed) {
+            // 🎯 续体恢复：校验通过，继续推进下游 Pipeline
+            fireDownstream(ctx, downstreamBuf);
+        } else {
+            // 🛡️ 拦截分支：升级为本地硬封禁并直接给客户端回写 403
+            localBanCache.putUserBan(userId, 60);
+            rejectAndRelease(ctx, downstreamBuf, 403, SecurityResponses.RESPONSE_403, RateLimitReasonCodes.REASON_LOCAL_BAN);
         }
     }
 

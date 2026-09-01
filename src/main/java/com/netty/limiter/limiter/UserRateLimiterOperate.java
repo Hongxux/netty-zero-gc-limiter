@@ -166,13 +166,7 @@ public class UserRateLimiterOperate {
                                                     expectedCtx.timeoutHandle.cancel();
                                                 }
                                                 // 调度回原 HTTP Channel 的 EventLoop 线程执行！
-                                                expectedCtx.httpCtx.executor().execute(() -> {
-                                                    try {
-                                                        expectedCtx.callback.onResult(allowedFlag == 1);
-                                                    } finally {
-                                                        expectedCtx.recycle();
-                                                    }
-                                                });
+                                                expectedCtx.httpCtx.executor().execute(() -> expectedCtx.completeAndRecycle(allowedFlag == 1));
                                             }
                                         }
                                     }
@@ -260,8 +254,7 @@ public class UserRateLimiterOperate {
             // 🛡️ Fail-Closed 降级保护：连接不可用时异步拒绝
             asyncCtx.httpCtx.executor().execute(() -> {
                 if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_RESOLVED)) {
-                    asyncCtx.callback.onResult(false);
-                    asyncCtx.recycle();
+                    asyncCtx.completeAndRecycle(false);
                 }
             });
             return;
@@ -272,8 +265,7 @@ public class UserRateLimiterOperate {
             asyncCtx.httpCtx.executor().execute(() -> {
                 if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_TIMEOUT)) {
                     // 超时快速拦截
-                    asyncCtx.callback.onResult(false);
-                    asyncCtx.recycle();
+                    asyncCtx.completeAndRecycle(false);
                 }
             });
         }, 50, TimeUnit.MILLISECONDS);
@@ -290,7 +282,28 @@ public class UserRateLimiterOperate {
                 } catch (Exception e) {
                     buf.release();
                     log.error("Error encoding/sending 0-GC async EVALSHA command for userId: {}", asyncCtx.userId, e);
+                    // 🛡️ 发送异常快速失败：取消槽位、取消超时，并调度回原线程快速拦截
+                    syncWaitSlotRingBuffer.cancel(asyncCtx);
+                    if (asyncCtx.timeoutHandle != null) {
+                        asyncCtx.timeoutHandle.cancel();
+                    }
+                    asyncCtx.httpCtx.executor().execute(() -> {
+                        if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_CANCELLED)) {
+                            asyncCtx.completeAndRecycle(false);
+                        }
+                    });
                 }
+            } else {
+                // 🛡️ 队列溢出快速失败 (RingBuffer Overflow Fail-Fast)：避免请求傻等 50ms 超时
+                log.warn("SyncWaitSlotRingBuffer overflow (full capacity 1024), fast-failing userId: {}", asyncCtx.userId);
+                if (asyncCtx.timeoutHandle != null) {
+                    asyncCtx.timeoutHandle.cancel();
+                }
+                asyncCtx.httpCtx.executor().execute(() -> {
+                    if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_CANCELLED)) {
+                        asyncCtx.completeAndRecycle(false);
+                    }
+                });
             }
         });
     }

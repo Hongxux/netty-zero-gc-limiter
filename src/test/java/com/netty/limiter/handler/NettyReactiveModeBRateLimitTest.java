@@ -163,24 +163,28 @@ public class NettyReactiveModeBRateLimitTest {
 
     @Test
     public void testAsyncContextRecyclerPooling() {
-        // 测试 Recycler 对象池获取与回收重置
+        // 测试 Recycler 对象池获取与回收重置 (初始与回收后状态均为 STATE_UNPUBLISHED)
         AsyncRateLimitContext ctx1 = AsyncRateLimitContext.acquire(null, null, 888L, allowed -> {});
         assertEquals(888L, ctx1.userId);
+        assertEquals(AsyncRateLimitContext.STATE_UNPUBLISHED, ctx1.state.get());
+
+        // 模拟生产者发布后状态置为 STATE_INIT
+        ctx1.state.set(AsyncRateLimitContext.STATE_INIT);
         assertEquals(AsyncRateLimitContext.STATE_INIT, ctx1.state.get());
 
-        // 状态变更
+        // 模拟 Redis 响应处理完毕
         ctx1.state.set(AsyncRateLimitContext.STATE_RESOLVED);
 
         // 回收
         ctx1.recycle();
         assertEquals(0L, ctx1.userId);
         assertNull(ctx1.callback);
-        assertEquals(AsyncRateLimitContext.STATE_INIT, ctx1.state.get());
+        assertEquals(AsyncRateLimitContext.STATE_UNPUBLISHED, ctx1.state.get());
 
-        // 再次获取应重用实例且状态已重置
+        // 再次获取应重用实例且状态已重置为 STATE_UNPUBLISHED
         AsyncRateLimitContext ctx2 = AsyncRateLimitContext.acquire(null, null, 999L, allowed -> {});
         assertEquals(999L, ctx2.userId);
-        assertEquals(AsyncRateLimitContext.STATE_INIT, ctx2.state.get());
+        assertEquals(AsyncRateLimitContext.STATE_UNPUBLISHED, ctx2.state.get());
         ctx2.recycle();
     }
 }
