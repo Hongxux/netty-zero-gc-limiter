@@ -604,60 +604,52 @@ flowchart TD
 * **水位触发全网广播**：
   Redis 侧 Lua 脚本在扣减后原子判断：若该 UID 剩余配额低于 20%，立即执行 `redis.call('PUBLISH', 'NETTY_LIMITER_BAN_CHANNEL', 'W:' .. uid)`。
 * **临界配额强同步精准拦截（Mode B）**：
-  网关订阅组件 `RedisUserBanSubscriber` 接收到广播后，在 `LocalBanCache` 中将该 UID 的状态标记为 `WARNED_EXP_SEC_MARK (-2L)`（Sync Required）。后续针对该 UID 的请求**强制切入 Mode B 同步校验**，直接由 Redis 仲裁最后的配额。既消除了 90% 以上常规请求的网络 RTT，又彻底封堵了集群超卖风险。
+  网关订阅组件 `RedisUserBanSubscriber` 接收到广播后，在 `LocalBanCache` 中将该 UID 的状态标记为 `WARNED_EXP_SEC_MARK (-2L)`（Sync Required）。后续针对该 UID 的请求**强制切入 Mode B 同步校验**，直接由 Redis 仲裁最后的配额。既消除了 90% 以上常规请求的网络 RTT 开销，又彻底封堵了在乐观异步放行模式下、因本地尚未感知到全局封禁状态而可能导致的“漏网放行”请求（确保黑名单与超限拦截 100% 严格生效）。
 
 ---
 
-### 五、 Netty-Redis 0-GC 异步转同步唤醒桥接器 (`SyncWaitSlotRingBuffer`)
+### 五、 0-GC 响应式无阻塞续体与 TCP 物理反压架构 (Reactive Continuation & Backpressure Engine)
 
-当限流切入 Mode B 同步校验时，多个网关 Worker 线程需要向 Redis 发送请求并同步阻塞等待结果。为了桥接 **Netty Redis 异步 IO 线程** 与 **网关 Worker 阻塞等待线程**，自研了零堆分配的同步唤醒桥接器。
+当限流切入 Mode B 同步校验时，网关全面升级为 **基于 Netty `autoRead(false)` TCP 物理反压 + `Recycler` 0-GC 异步上下文池 + 跨 EventLoop 线程安全调度 + `HashedWheelTimer` 50ms 超时熔断** 的原生响应式无阻塞架构，同时保留 `SyncWaitSlotRingBuffer` 作为同步阻塞兼容桥接器。
 
 ```
-网关 Worker 线程 (Producer)                           Netty Redis IO 线程 (Consumer)
+网关 EventLoop 线程 (Http-EL)                           Netty Redis EventLoop 线程 (Redis-EL)
 ┌──────────────────────────────────────┐             ┌──────────────────────────────────────────┐
-│ 1. 从 FTL 抓取独占 Slot (0-GC)        │             │ 1. LineBasedFrameDecoder 收齐 RESP2 响应 │
-│ 2. 提交 EventLoop 顺序入队与发送 TCP   │             │ 2. 原位解析 UID 与 Status                 │
-│ 3. LockSupport.parkNanos(50ms) 阻塞  │             │ 3. 匹配队头 Slot，写入 status = 1/2      │
-│ 4. 唤醒成功：返回放行/拦截结果        │ ◄── unpark ─┤ 4. LockSupport.unpark(waiterThread)      │
-│ 5. 超时 50ms：CAS 替换 CANCELLED_SLOT│             │ 5. 出队 poll() 原子清空为 ZERO_SLOT      │
+│ 1. 收到 HTTP 请求，判定切入 Mode B    │             │                                          │
+│ 2. 物理反压：setAutoRead(false) 暂停 │             │                                          │
+│ 3. 从 Recycler 借出 0-GC AsyncContext │             │                                          │
+│ 4. 提交 Redis-EL 异步 Pipeline 发送  │ ──────────► │ 1. 串行入队并发送 RESP2 EVALSHA 字节流   │
+│ 5. Http-EL 立即释放！(0 线程阻塞)     │             │ 2. Redis 返回，LineBasedFrameDecoder 收包│
+│                                      │             │ 3. 原位解析 UID 与 Status                 │
+│ 6. 恢复读取：setAutoRead(true)       │ ◄─ execute ─┤ 4. CAS 抢占状态并取消 50ms 时间轮超时任务│
+│ 7. 放行 fireDownstream / 拦截 403    │             │ 5. httpCtx.executor() 调度回原 Http-EL   │
+│ 8. 归还 Recycler (100% 0-GC)         │             │                                          │
 └──────────────────────────────────────┘             └──────────────────────────────────────────┘
 ```
 
-#### 1. 类继承阶梯 Cache Line 填充隔离 (Disruptor 模式)
-为了防止高频并发下生产者与消费者修改指针产生伪共享（False Sharing），采用遵从 JVM 规范的**类继承阶梯隔离结构**（避免 HotSpot JVM 字段重排序打破平铺 padding）：
-```java
-abstract class SyncWaitSlotRingBufferPad0 { protected long p00, p01, p02, p03, p04, p05, p06, p07; }
-abstract class SyncWaitSlotRingBufferConsumerFields extends SyncWaitSlotRingBufferPad0 {
-    protected long nextNeededAckSequence = 0;
-    protected long cachedNextAvailableRequestSequence = 0;
-}
-abstract class SyncWaitSlotRingBufferPad1 extends SyncWaitSlotRingBufferConsumerFields { protected long p10, p11, p12, p13, p14, p15, p16, p17; }
-abstract class SyncWaitSlotRingBufferProducerFields extends SyncWaitSlotRingBufferPad1 {
-    protected long nextAvailableRequestSequence = 0;
-    protected long cachedNextNeededAckSequence = 0;
-}
-abstract class SyncWaitSlotRingBufferPad2 extends SyncWaitSlotRingBufferProducerFields { protected long p20, p21, p22, p23, p24, p25, p26, p27; }
-public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 { ... }
-```
-读写序列号之间物理填充 56 字节，保证消费者与生产者变量严格隔离在不同的 64 字节 CPU 缓存行中。
+#### 1. Netty `autoRead(false)` 4 层物理级 TCP 反压 (Backpressure)
+在全异步非阻塞网关中，如果不暂停读取，客户端连续发送的后续请求会并发穿透并导致内存雪崩。
+本项目通过 `channel.config().setAutoRead(false)` 触发链式反应：
+1. **网关应用层**：从 Netty Selector 中摘除 `OP_READ` 事件，停止读取 TCP 数据；
+2. **网关 Linux 内核**：内核 `SO_RCVBUF` 接收缓冲区迅速填满；
+3. **TCP 协议层**：Linux TCP 协议栈在发送 ACK 时宣告 **`Window Size = 0`（零窗口通知）**；
+4. **客户端机器**：客户端操作系统物理停止发包，将内存压力原路反推回客户端自身，网关自身内存始终恒定在极低水平，彻底杜绝 OOM。
+5. **解除反压**：Redis 响应返回后调用 `setAutoRead(true)`，Linux 发送 `Window Update ACK`，客户端瞬间恢复发包。
 
-#### 2. 双向 Safe Zone 局部序列号缓存 (消除 99.99% 总线嗅探)
-生产者在检查队列是否已满时，优先读取本地缓存的 `cachedNextNeededAckSequence`。仅当本地安全区耗尽（发生临界满）时，才触发一次昂贵的跨核 `getAcquire` 读取真实的消费者序列号。消费者出队亦然。**总线跨核嗅探（Bus Sniffing）降低 99.99%**。
+#### 2. Netty `Recycler` 0-GC 异步上下文对象池 (`AsyncRateLimitContext`)
+为了消除回调产生的堆内存垃圾与 `CompletableFuture` 对象分配，自研基于 Netty `Recycler` 的无锁对象池：
+* **四态 CAS 状态机防护**：内置 `AtomicInteger state`（`0: INIT, 1: RESOLVED, 2: TIMEOUT, 3: CANCELLED`），在 Redis 响应与 50ms 时间轮超时并发到达时提供原子互斥保障；
+* **生命周期闭环**：请求透传或拦截后立即调用 `asyncCtx.recycle()` 重置所有字段引用并归还对象池，100% 零堆内存分配。
 
-#### 3. FTL 实例池化与超时脱钩 (COW 哨兵机制)
-* **FTL 实例复用**：通过 `FastThreadLocal<SyncWaitSlot>` 让每个 Worker 线程独占一个预分配的 Slot 对象，全生命周期 0 堆对象创建。
-* **对象别名与迟到响应解耦 (Aliasing Elimination)**：
-  如果网关线程等待超过 50ms 超时放弃，而其私有 Slot 对象后续被下一次请求复用，迟到的 Redis 响应可能会误唤醒新的无关请求。
-  本项目设计了 `ZERO_SLOT`（空槽）与 `CANCELLED_SLOT`（超时放弃）哨兵：
-  ```java
-  // 超时时，生产者以 CAS 将槽位原子替换为 CANCELLED_SLOT，彻底剥离 FTL 对象指针引用
-  ARRAY_VH.compareAndSet(array, index, slot, CANCELLED_SLOT);
-  ```
-  消费侧 EventLoop 扫描到 `CANCELLED_SLOT` 时直接丢弃推进队列；正常处理完则以 `ZERO_SLOT` 写回完成 COW 原子清空。
+#### 3. 跨 EventLoop 线程亲和性与安全调度 (Thread Affinity)
+HTTP 连接运行在 `WorkerEventLoopGroup`，而 Redis 客户端运行在 `RedisEventLoopGroup`。
+当 Redis-EL 收到响应后，**绝对不直接跨线程操作 HTTP Channel**，而是通过 `asyncCtx.httpCtx.executor().execute(...)` 将恢复与透传逻辑调度回该连接绑定的原始 EventLoop 线程执行，严格维持 Netty 单线程无锁执行模型。
 
-#### 4. 内存屏障与严格 FIFO 顺序保障
-* **轻量级内存屏障**：Slot 内部字段（`userId`, `status`, `waiterThread`）保持为普通 Plain 字段，不添加 `volatile` 读写开销。仅通过数组元素的 `arrayElementVarHandle` (`ARRAY_VH.setRelease` / `getAcquire`) 建立 Release-Acquire 内存屏障，借助 JMM Happens-Before 传递性保障跨核可见性。
-* **单线程严格串行入队**：将 `syncWaitSlotRingBuffer.offer(slot)` 与底层 `redisChannel.writeAndFlush(buf)` 统一提交至 Netty EventLoop 中串行执行。**确保：EventLoop 任务队列顺序 == RingBuffer 序列号分配顺序 == TCP Socket 发送顺序 == Redis RESP2 回包顺序**，从体系结构层面彻底杜绝并发乱序错位。
+#### 4. 兼容性同步桥接器 (`SyncWaitSlotRingBuffer`)
+为了在兼容传统同步签名（如 Servlet Filter、阻塞 SDK）的场景下同样达成 0-GC，自研了基于 `FastThreadLocal` 预分配槽位与 Disruptor 继承阶梯缓存行隔离的无锁等待环：
+* **类继承阶梯 Cache Line 填充隔离**：通过 `Pad0 -> ConsumerFields -> Pad1 -> ProducerFields -> Pad2` 类继承链物理填充 56 字节，保证读写序列号严格隔离在不同的 64 字节 CPU 缓存行中，杜绝伪共享（False Sharing）；
+* **双向 Safe Zone 局部序列号缓存**：生产者优先读取本地 `cachedNextNeededAckSequence`，总线跨核嗅探（Bus Sniffing）降低 99.99%；
+* **COW 哨兵机制 (`ZERO_SLOT` / `CANCELLED_SLOT`)**：50ms 超时时生产者原子 CAS 替换槽位脱钩，防止迟到的 Redis 响应误唤醒复用的新请求。
 
 ---
 

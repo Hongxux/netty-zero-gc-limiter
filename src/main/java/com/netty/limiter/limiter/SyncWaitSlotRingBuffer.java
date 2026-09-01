@@ -71,6 +71,7 @@ public class SyncWaitSlotRingBuffer extends SyncWaitSlotRingBufferPad2 {
         public long userId;
         public int status;        // 0=pending, 1=passed, 2=blocked
         public Thread waiterThread;
+        public AsyncRateLimitContext asyncCtx; // 🎯 0-GC 响应式异步上下文
         public int index;         // 🎯 记录当前 Slot 被放入 RingBuffer 的数组下标
     }
 

@@ -18,6 +18,7 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.handler.timeout.IdleStateHandler;
+import io.netty.util.HashedWheelTimer;
 import io.netty.util.concurrent.FastThreadLocal;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -28,6 +29,7 @@ import javax.annotation.PreDestroy;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -90,6 +92,8 @@ public class UserRateLimiterOperate {
         }
     };
 
+    private static final HashedWheelTimer HASHED_WHEEL_TIMER = new HashedWheelTimer(10, TimeUnit.MILLISECONDS);
+
     @PostConstruct
     public void init() {
         eventLoopGroup = new NioEventLoopGroup(1);
@@ -99,6 +103,8 @@ public class UserRateLimiterOperate {
     @PreDestroy
     public void destroy() {
         try {
+            // 0. 停止时间轮
+            HASHED_WHEEL_TIMER.stop();
             // 1. 优先优雅关闭 Redis 驱动 EventLoop 线程池
             if (eventLoopGroup != null) {
                 eventLoopGroup.shutdownGracefully().syncUninterruptibly();
@@ -154,8 +160,29 @@ public class UserRateLimiterOperate {
                                             // 🎯 返回的 UID 与队头等待槽位的 UID 精确匹配！
                                             syncWaitSlotRingBuffer.poll(); // COW 替换 ZERO_SLOT，原子清空槽位
                                             expectedSlot.status = (allowedFlag == 1) ? 1 : 2;
-                                            Thread targetThread = expectedSlot.waiterThread;
-                                            if (targetThread != null) {
+
+                                            // 🎯 分支 1: 原生响应式异步模式 (0-GC 调度回原 HTTP EventLoop)
+                                            if (expectedSlot.asyncCtx != null) {
+                                                AsyncRateLimitContext asyncCtx = expectedSlot.asyncCtx;
+                                                expectedSlot.asyncCtx = null; // 解绑引用切断物理内存泄露
+                                                if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_RESOLVED)) {
+                                                    if (asyncCtx.timeoutHandle != null) {
+                                                        asyncCtx.timeoutHandle.cancel();
+                                                    }
+                                                    // 调度回原 HTTP Channel 的 EventLoop 线程执行！
+                                                    asyncCtx.httpCtx.executor().execute(() -> {
+                                                        try {
+                                                            asyncCtx.callback.onResult(allowedFlag == 1);
+                                                        } finally {
+                                                            asyncCtx.recycle();
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                            // 🎯 分支 2: 兼容同步阻塞模式 (unpark 唤醒 Worker 线程)
+                                            else if (expectedSlot.waiterThread != null) {
+                                                Thread targetThread = expectedSlot.waiterThread;
+                                                expectedSlot.waiterThread = null;
                                                 java.util.concurrent.locks.LockSupport.unpark(targetThread);
                                             }
                                         }
@@ -230,6 +257,67 @@ public class UserRateLimiterOperate {
     private final SyncWaitSlotRingBuffer syncWaitSlotRingBuffer = new SyncWaitSlotRingBuffer(1024);
 
     /**
+     * 🚀 模式 B 原生响应式无阻塞校验 (0-GC Reactive Async Non-Blocking Rate Limit):
+     * 针对 80% 水位预警 (-2L) UID 执行 RESP2 0-GC 异步 EVALSHA 扣减与非阻塞回调。
+     *
+     * 核心优势：
+     * 1. 0 线程阻塞：绝不调用 LockSupport.park，当前 EventLoop 线程立即释放；
+     * 2. 0 堆内存分配：基于 Recycler 池化的 AsyncRateLimitContext 传递上下文；
+     * 3. 50ms HashedWheelTimer 超时熔断与防孤儿泄漏；
+     * 4. Redis 响应后通过 asyncCtx.httpCtx.executor().execute() 精准调度回原 HTTP EventLoop。
+     */
+    public void acquire0GcUidAsync(AsyncRateLimitContext asyncCtx, byte[] luaShaBytes) {
+        if (redisChannel == null || !redisChannel.isActive()) {
+            // 🛡️ Fail-Closed 降级保护：连接不可用时异步拒绝
+            asyncCtx.httpCtx.executor().execute(() -> {
+                if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_RESOLVED)) {
+                    asyncCtx.callback.onResult(false);
+                    asyncCtx.recycle();
+                }
+            });
+            return;
+        }
+
+        // 1. 注册 50ms 时间轮超时熔断任务
+        asyncCtx.timeoutHandle = HASHED_WHEEL_TIMER.newTimeout(timeout -> {
+            asyncCtx.httpCtx.executor().execute(() -> {
+                if (asyncCtx.state.compareAndSet(AsyncRateLimitContext.STATE_INIT, AsyncRateLimitContext.STATE_TIMEOUT)) {
+                    // 超时快速拦截
+                    asyncCtx.callback.onResult(false);
+                    asyncCtx.recycle();
+                }
+            });
+        }, 50, TimeUnit.MILLISECONDS);
+
+        // 2. 从 FTL 借用独占 Slot，统一放入 SyncWaitSlotRingBuffer (0-GC 统一等待环)
+        SyncWaitSlotRingBuffer.SyncWaitSlot slot = SyncWaitSlotRingBuffer.THREAD_SLOT.get();
+        slot.userId = asyncCtx.userId;
+        slot.asyncCtx = asyncCtx;
+        slot.waiterThread = null;
+        slot.status = 0;
+
+        // 3. 统一提交到 Redis EventLoop 串行入队并发送 TCP 字节流
+        redisChannel.eventLoop().execute(() -> {
+            boolean offered = syncWaitSlotRingBuffer.offer(slot);
+            if (offered) {
+                ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer(256);
+                try {
+                    encodeResp2EvalSha(buf, luaShaBytes, asyncCtx.userId,
+                            System.currentTimeMillis(), maxTokens(), refillRate(), ttlSeconds(), 1);
+                    redisChannel.writeAndFlush(buf);
+                } catch (Exception e) {
+                    buf.release();
+                    log.error("Error encoding/sending 0-GC async EVALSHA command for userId: {}", asyncCtx.userId, e);
+                }
+            }
+        });
+    }
+
+    public void acquire0GcUidAsync(AsyncRateLimitContext asyncCtx) {
+        acquire0GcUidAsync(asyncCtx, luaShaBytes);
+    }
+
+    /**
      * 🚀 模式 B (0-GC 同步上报放行校验): 针对 80% 水位预警 (-2L) UID 执行 RESP2 0-GC 同步 EVALSHA 扣减
      * 100% 零 GC 堆内存分配，无 Node 垃圾回收负担。
      */
@@ -243,6 +331,7 @@ public class UserRateLimiterOperate {
         SyncWaitSlotRingBuffer.SyncWaitSlot slot = SyncWaitSlotRingBuffer.THREAD_SLOT.get();
         slot.userId = userId;
         slot.waiterThread = currentThread;
+        slot.asyncCtx = null; // 同步模式清空 asyncCtx
         slot.status = 0;
 
         // 🎯 核心并发安全修正 (100% 绝对 FIFO 保障)：

@@ -89,13 +89,26 @@ public class NettyInboundSecurityHandler extends ChannelInboundHandlerAdapter {
                     rejectAndRelease(ctx, downstreamBuf, 403, SecurityResponses.RESPONSE_403, RateLimitReasonCodes.REASON_LOCAL_BAN);
                     return;
                 } else if (userBanStatus == LocalBanCache.BAN_STATUS_WARNED_SYNC_REQUIRED) {
-                    // 🚨 80% 水位降级预警 (ExpSec == -2L)：执行【同步上报版本】，必须等待 Redis 返回 Ack (1 放行 / 0 拒绝)
-                    boolean granted = userRateLimiterOperate.acquire0GcUidSync(userId, com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
-                    if (!granted) {
-                        localBanCache.putUserBan(userId, 60); // 升级为硬封禁
-                        rejectAndRelease(ctx, downstreamBuf, 403, SecurityResponses.RESPONSE_403, RateLimitReasonCodes.REASON_LOCAL_BAN);
-                        return;
-                    }
+                    // 🚨 80% 水位降级预警 (ExpSec == -2L)：执行【0-GC 响应式异步无阻塞校验 + TCP 物理反压】
+                    // 1. 物理反压：暂停当前 TCP Socket 读取，通过 TCP 零窗口将内存压力反推给客户端
+                    ctx.channel().config().setAutoRead(false);
+
+                    // 2. 从对象池借出 0-GC 异步上下文
+                    com.netty.limiter.limiter.AsyncRateLimitContext asyncCtx =
+                            com.netty.limiter.limiter.AsyncRateLimitContext.acquire(ctx, downstreamBuf, userId, (granted) -> {
+                                // 3. 恢复 TCP Socket 自动读取
+                                ctx.channel().config().setAutoRead(true);
+                                if (!granted) {
+                                    localBanCache.putUserBan(userId, 60); // 升级为硬封禁
+                                    rejectAndRelease(ctx, downstreamBuf, 403, SecurityResponses.RESPONSE_403, RateLimitReasonCodes.REASON_LOCAL_BAN);
+                                } else {
+                                    fireDownstream(ctx, downstreamBuf);
+                                }
+                            });
+
+                    // 4. 异步发射 Redis EVALSHA 扣减请求，当前 EventLoop 线程立即释放！
+                    userRateLimiterOperate.acquire0GcUidAsync(asyncCtx);
+                    return; // 立即返回，等待异步唤醒回调继续执行！
                 } else {
                     // 🚀 普通未预警 UID：执行【异步非阻塞上报版本】(Async Offloading + Pipeline 攒批)
                     userRateLimiterOperate.acquire0GcUidBatch(userId, com.netty.limiter.util.LuaSha1Util.DEFAULT_LUA_SHA1_BYTES);
